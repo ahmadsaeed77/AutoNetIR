@@ -1,7 +1,8 @@
+import logging
 import os
 import time
+
 import requests
-import logging
 
 from utils.ip_utils import is_public_ip
 
@@ -10,9 +11,8 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 VT_API_KEY = os.getenv("VT_API_KEY")
 VT_BASE_URL = "https://www.virustotal.com/api/v3/ip_addresses"
 
-# Simple rate limiter (4 requests / minute)
 LAST_REQUEST_TIME = 0
-RATE_LIMIT_DELAY = 16  # seconds
+RATE_LIMIT_DELAY = 16
 
 
 def rate_limited_request():
@@ -60,7 +60,6 @@ def lookup_ip_virustotal(ip):
             "as_owner": attributes.get("as_owner"),
         }
 
-        # 🔥 Smart classification
         if result["malicious"] > 0:
             result["threat_level"] = "HIGH"
         elif result["suspicious"] > 0:

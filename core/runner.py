@@ -8,12 +8,8 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from detection.arp_spoofing import detect_arp_spoofing
-from detection.icmp_redirect import detect_icmp_redirect_attack
-from detection.icmp_tunneling import detect_icmp_tunneling
-from detection.tcp_rst_attack import detect_tcp_rst_attack
-from detection.tcp_syn_scan import detect_tcp_syn_port_scan
-from detection.tls_renegotiation import detect_tls_renegotiation
+from detection.hybrid.detector import build_detection_summary, detect_hybrid_attacks
+from detection.hybrid.registry import ATTACK_REGISTRY
 from enrichment.virustotal_lookup import enrich_alerts_with_virustotal
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -21,53 +17,13 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 DETECTOR_REGISTRY = [
     {
-        "id": "arp_spoofing",
-        "name": "ARP Spoofing",
-        "function": detect_arp_spoofing,
+        "id": "hybrid_known_attacks",
+        "name": "Hybrid Known Attack Detection",
+        "function": detect_hybrid_attacks,
         "enabled": True,
         "kwargs": {},
-        "description": "Detects one IP address being advertised by multiple MAC addresses.",
-    },
-    {
-        "id": "tcp_syn_scan",
-        "name": "TCP SYN Port Scan",
-        "function": detect_tcp_syn_port_scan,
-        "enabled": True,
-        "kwargs": {"port_threshold": 10},
-        "description": "Detects many SYN packets from one source to many destination ports.",
-    },
-    {
-        "id": "tcp_rst_attack",
-        "name": "TCP RST Attack / Scan",
-        "function": detect_tcp_rst_attack,
-        "enabled": True,
-        "kwargs": {"rst_threshold": 20, "bidirectional_rst_threshold": 2},
-        "description": "Detects high TCP reset volume between a source and destination.",
-    },
-    {
-        "id": "tls_renegotiation",
-        "name": "TLS/SSL Renegotiation Abuse",
-        "function": detect_tls_renegotiation,
-        "enabled": True,
-        "kwargs": {"renegotiation_threshold": 3},
-        "description": "Detects repeated TLS ClientHello messages between hosts.",
-    },
-    {
-        "id": "icmp_redirect",
-        "name": "ICMP Redirect Attack",
-        "function": detect_icmp_redirect_attack,
-        "enabled": True,
-        "kwargs": {"threshold": 5},
-        "description": "Detects repeated ICMP Redirect messages and suspicious gateways.",
-    },
-    {
-        "id": "icmp_tunneling",
-        "name": "ICMP Tunneling / Anomaly",
-        "function": detect_icmp_tunneling,
-        "enabled": True,
-        "kwargs": {"packet_threshold": 25, "avg_size_threshold": 120},
-        "description": "Detects high-volume or large ICMP echo traffic that may indicate tunneling.",
-    },
+        "description": "Detects five known attacks using signature and behavior evidence.",
+    }
 ]
 
 
@@ -90,26 +46,6 @@ def create_run_paths(pcap_path, output_root=None):
         "events_path": str(run_dir / "events.jsonl"),
         "alerts_path": str(run_dir / "alerts.jsonl"),
     }
-
-
-def selected_detectors(enabled_detectors=None, detector_overrides=None):
-    enabled_set = set(enabled_detectors) if enabled_detectors else None
-    detector_overrides = detector_overrides or {}
-    selected = []
-
-    for detector in DETECTOR_REGISTRY:
-        if not detector.get("enabled", True):
-            continue
-
-        if enabled_set is not None and detector["id"] not in enabled_set:
-            continue
-
-        config = dict(detector)
-        config["kwargs"] = dict(detector.get("kwargs", {}))
-        config["kwargs"].update(detector_overrides.get(detector["id"], {}))
-        selected.append(config)
-
-    return selected
 
 
 def run_parser(pcap_path, events_path):
@@ -171,13 +107,24 @@ def calculate_event_stats(events_path):
     }
 
 
+def calculate_detection_summary(events_path):
+    if not os.path.exists(events_path):
+        return {
+            "baseline_method": "per-PCAP peer baseline",
+            "host_profiles": [],
+            "pair_profiles": [],
+            "arp_identity": {},
+        }
+    return build_detection_summary(events_path)
+
+
 def save_alerts(alerts, alerts_path):
     with open(alerts_path, "w", encoding="utf-8") as file:
         for alert in alerts:
             file.write(json.dumps(alert, ensure_ascii=False) + "\n")
 
 
-def run_pipeline(pcap_path, enabled_detectors=None, detector_overrides=None, output_root=None):
+def run_pipeline(pcap_path, output_root=None):
     paths = create_run_paths(pcap_path, output_root=output_root)
     errors = []
     detector_results = []
@@ -199,50 +146,43 @@ def run_pipeline(pcap_path, enabled_detectors=None, detector_overrides=None, out
             "alerts_path": paths["alerts_path"],
             "packet_count": 0,
             "stats": calculate_event_stats(paths["events_path"]),
+            "detection_summary": calculate_detection_summary(paths["events_path"]),
             "alerts": [],
             "detectors": detector_results,
             "errors": errors,
         }
 
-    all_alerts = []
-    for detector in selected_detectors(enabled_detectors, detector_overrides):
-        try:
-            alerts = detector["function"](paths["events_path"], **detector["kwargs"])
-            all_alerts.extend(alerts)
-            detector_results.append({
-                "id": detector["id"],
-                "name": detector["name"],
-                "alert_count": len(alerts),
-                "status": "ok",
-                "kwargs": detector["kwargs"],
-            })
-        except Exception as error:
-            logging.warning("%s detection failed: %s", detector["name"], error)
-            errors.append({
-                "stage": "detector",
-                "detector": detector["name"],
-                "message": str(error),
-            })
-            detector_results.append({
-                "id": detector["id"],
-                "name": detector["name"],
-                "alert_count": 0,
-                "status": "failed",
-                "kwargs": detector["kwargs"],
-            })
+    try:
+        alerts = detect_hybrid_attacks(paths["events_path"])
+        detector_results.append({
+            "id": "hybrid_known_attacks",
+            "name": "Hybrid Known Attack Detection",
+            "alert_count": len(alerts),
+            "status": "ok",
+            "supported_attacks": [attack["id"] for attack in ATTACK_REGISTRY],
+        })
+    except Exception as error:
+        logging.warning("Hybrid detection failed: %s", error)
+        errors.append({
+            "stage": "detector",
+            "detector": "Hybrid Known Attack Detection",
+            "message": str(error),
+        })
+        alerts = []
 
     try:
-        enriched_alerts = enrich_alerts_with_virustotal(all_alerts)
+        enriched_alerts = enrich_alerts_with_virustotal(alerts)
     except Exception as error:
         logging.warning("Enrichment failed: %s", error)
         errors.append({
             "stage": "enrichment",
             "message": str(error),
         })
-        enriched_alerts = all_alerts
+        enriched_alerts = alerts
 
     save_alerts(enriched_alerts, paths["alerts_path"])
     stats = calculate_event_stats(paths["events_path"])
+    detection_summary = calculate_detection_summary(paths["events_path"])
 
     logging.info("Pipeline completed with %s alerts", len(enriched_alerts))
 
@@ -254,6 +194,7 @@ def run_pipeline(pcap_path, enabled_detectors=None, detector_overrides=None, out
         "alerts_path": paths["alerts_path"],
         "packet_count": stats["packet_count"],
         "stats": stats,
+        "detection_summary": detection_summary,
         "alerts": enriched_alerts,
         "detectors": detector_results,
         "errors": errors,

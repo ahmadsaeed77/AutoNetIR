@@ -1,28 +1,46 @@
-def build_alert(
+def build_hybrid_alert(
+    attack_type,
     alert_type,
+    detection_method,
     severity,
+    confidence,
     evidence,
     recommendation,
-    confidence,
-    mitre_or_attack_category,
     src_ip=None,
     dst_ip=None,
-    **details,
+    signature_evidence=None,
+    behavior_evidence=None,
+    behavior_score=0,
+    limitations=None,
 ):
-    """Create a consistent alert shape for every detector."""
-    alert = {
+    return {
+        "attack_type": attack_type,
         "alert_type": alert_type,
+        "detection_method": detection_method,
         "severity": str(severity).upper(),
+        "confidence": str(confidence).upper(),
         "src_ip": src_ip,
         "dst_ip": dst_ip,
         "evidence": evidence,
+        "signature_evidence": signature_evidence or {},
+        "behavior_evidence": behavior_evidence or {},
+        "behavior_score": behavior_score,
         "recommendation": recommendation,
-        "confidence": confidence,
-        "mitre_or_attack_category": mitre_or_attack_category,
+        "limitations": limitations or "",
     }
 
-    for key, value in details.items():
-        if value is not None:
-            alert[key] = value
 
-    return alert
+def severity_from_score(score):
+    if score >= 80:
+        return "HIGH"
+    if score >= 50:
+        return "MEDIUM"
+    return "LOW"
+
+
+def confidence_from_method(detection_method, score=0):
+    if detection_method == "hybrid":
+        return "HIGH" if score >= 70 else "MEDIUM"
+    if detection_method == "signature":
+        return "HIGH"
+    return "MEDIUM" if score >= 60 else "LOW"

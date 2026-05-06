@@ -6,6 +6,14 @@ import shutil
 import pyshark
 
 
+def first_available(layer, *names):
+    for name in names:
+        value = getattr(layer, name, None)
+        if value is not None:
+            return value
+    return None
+
+
 def get_tshark_path():
     """
     Find tshark automatically on different devices.
@@ -112,6 +120,23 @@ def parse_packet(pkt):
             event["tcp_flags_ack"] = getattr(pkt.tcp, "flags_ack", None)
             event["tcp_flags_rst"] = getattr(pkt.tcp, "flags_reset", None)
             event["tcp_flags_fin"] = getattr(pkt.tcp, "flags_fin", None)
+
+            if hasattr(pkt, "http"):
+                event["app_protocol"] = "HTTP"
+                event["http_method"] = first_available(pkt.http, "request_method")
+                event["http_uri"] = first_available(
+                    pkt.http,
+                    "request_full_uri",
+                    "request_uri",
+                    "request_uri_path",
+                )
+                event["http_host"] = first_available(pkt.http, "host")
+                event["http_response_code"] = first_available(
+                    pkt.http,
+                    "response_code",
+                    "response_code_desc",
+                )
+                event["http_user_agent"] = first_available(pkt.http, "user_agent")
 
             if hasattr(pkt, "tls"):
                 event["app_protocol"] = "HTTPS"
