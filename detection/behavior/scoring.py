@@ -40,4 +40,6 @@ def peer_baseline(rows, field, exclude_src_ip=None):
 
 def behavior_score(observed, baseline_median, minimum_reference=1):
     reference = max(float(baseline_median or 0), minimum_reference)
-    return min(100, round((observed / reference) * 25, 1))
+    # Ratio-based 0-100 score: 1x baseline ~= 30, 2x ~= 60,
+    # 3x ~= 90, and 3.33x or higher caps at 100.
+    return min(100, round((observed / reference) * 30, 1))

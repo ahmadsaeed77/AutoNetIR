@@ -1,4 +1,4 @@
-from parser.pcap_parser import parse_packet
+from parser.pcap_parser import detect_app_protocol, parse_packet
 
 
 class Obj:
@@ -75,3 +75,11 @@ def test_parse_icmp_fields():
     assert event["transport"] == "ICMP"
     assert event["icmp_type"] == "8"
     assert event["icmp_seq"] == "10"
+
+
+def test_detect_app_protocol_common_ports_and_destination_priority():
+    assert detect_app_protocol(51515, 3389) == "RDP"
+    assert detect_app_protocol(51515, 3306) == "MYSQL"
+    assert detect_app_protocol(22, 443) == "HTTPS"
+    assert detect_app_protocol(5432, 65000) == "POSTGRESQL"
+    assert detect_app_protocol(65000, 65001) is None

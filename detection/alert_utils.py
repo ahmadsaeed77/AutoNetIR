@@ -1,3 +1,5 @@
+from datetime import datetime
+
 def build_hybrid_alert(
     attack_type,
     alert_type,
@@ -27,6 +29,7 @@ def build_hybrid_alert(
         "behavior_score": behavior_score,
         "recommendation": recommendation,
         "limitations": limitations or "",
+        "detected_at": datetime.utcnow().isoformat() + "Z",
     }
 
 

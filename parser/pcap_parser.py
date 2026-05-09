@@ -51,18 +51,41 @@ def get_tshark_path():
 
 
 def detect_app_protocol(src_port, dst_port):
-    ports = {src_port, dst_port}
-
     port_map = {
+        20: "FTP-DATA",
+        21: "FTP",
         22: "SSH",
-        80: "HTTP",
-        443: "HTTPS",
+        23: "TELNET",
+        25: "SMTP",
         53: "DNS",
+        67: "DHCP",
+        68: "DHCP",
+        80: "HTTP",
+        110: "POP3",
+        123: "NTP",
+        143: "IMAP",
+        161: "SNMP",
+        389: "LDAP",
+        443: "HTTPS",
+        445: "SMB",
+        465: "SMTPS",
+        587: "SMTP-SUBMISSION",
+        993: "IMAPS",
+        995: "POP3S",
+        1433: "MSSQL",
+        1521: "ORACLE",
+        3306: "MYSQL",
+        3389: "RDP",
+        5432: "POSTGRESQL",
+        5900: "VNC",
+        6379: "REDIS",
+        8080: "HTTP-ALT",
+        8443: "HTTPS-ALT",
     }
 
-    for port, protocol in port_map.items():
-        if port in ports:
-            return protocol
+    for port in (dst_port, src_port):
+        if port in port_map:
+            return port_map[port]
 
     return None
 

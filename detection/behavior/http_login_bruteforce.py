@@ -1,7 +1,7 @@
 from detection.behavior.scoring import behavior_score, peer_baseline
 
 
-def detect(features, min_attempts=5, min_score=50):
+def detect(features, min_attempts=5, min_score=60):
     hosts = features["host_profiles"]
     findings = []
 

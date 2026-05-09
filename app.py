@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import html
 import io
 import json
@@ -9,6 +9,8 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from core.runner import run_pipeline
@@ -18,280 +20,607 @@ from parser.pcap_parser import get_tshark_path
 
 
 st.set_page_config(
-    page_title="AutoNetIR PCAP Analysis",
+    page_title="AutoNetIR - Forensic PCAP Analysis",
     layout="wide",
     page_icon="A",
 )
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Constants and mappings
+# ---------------------------------------------------------------------------
+
+APP_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = APP_DIR / "uploads"
 
 PIPELINE_STAGES = [
-    "Upload",
-    "Parse",
-    "Extract Events",
-    "Signature Detection",
-    "Behavior Detection",
-    "Hybrid Correlation",
-    "Enrichment",
-    "Results",
+    ("01", "Upload", "Saving PCAP to disk..."),
+    ("02", "Parse", "Parsing packets with TShark..."),
+    ("03", "Extract Events", "Extracting normalized network events..."),
+    ("04", "Signature Detection", "Matching known attack signatures..."),
+    ("05", "Behavior Detection", "Profiling host behavior inside this PCAP..."),
+    ("06", "Hybrid Correlation", "Correlating signature and behavior evidence..."),
+    ("07", "Enrichment", "Adding enrichment and external context..."),
+    ("08", "Results", "Preparing the forensic analysis report..."),
 ]
 
+CHART_COLORS = [
+    "#7c3aed",
+    "#a855f7",
+    "#06b6d4",
+    "#f59e0b",
+    "#ef4444",
+    "#10b981",
+    "#f97316",
+]
+
+PROTOCOL_COLORS = {
+    "TCP": "#06b6d4",
+    "UDP": "#7c3aed",
+    "ICMP": "#f97316",
+    "ARP": "#f59e0b",
+    "HTTP": "#a855f7",
+    "HTTPS": "#10b981",
+    "UNKNOWN": "#6b5fa0",
+}
+
+SEVERITY_COLORS = {
+    "HIGH": "#ef4444",
+    "MEDIUM": "#f59e0b",
+    "LOW": "#10b981",
+    "INFO": "#06b6d4",
+    "UNKNOWN": "#6b5fa0",
+}
+
+METHOD_COLORS = {
+    "signature": "#06b6d4",
+    "behavior": "#f97316",
+    "hybrid": "#a855f7",
+    "unknown": "#6b5fa0",
+}
+
+PLOTLY_LAYOUT = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter", color="#a89cc8"),
+    margin=dict(l=10, r=10, t=48, b=10),
+    legend=dict(font=dict(color="#a89cc8")),
+)
+
+MITRE_MAPPING = {
+    "ssh_bruteforce": {
+        "tactic": "Credential Access",
+        "technique": "T1110 - Brute Force",
+        "sub_technique": "T1110.001 - Password Guessing",
+        "url": "https://attack.mitre.org/techniques/T1110/001/",
+        "description": "Repeated SSH connection attempts can indicate brute force or password guessing activity against exposed remote access.",
+    },
+    "http_login_bruteforce": {
+        "tactic": "Credential Access",
+        "technique": "T1110 - Brute Force",
+        "sub_technique": "T1110.001 - Password Guessing (HTTP)",
+        "url": "https://attack.mitre.org/techniques/T1110/001/",
+        "description": "Repeated POST requests to authentication paths can indicate automated credential stuffing or login brute force attempts.",
+    },
+    "port_scan": {
+        "tactic": "Discovery",
+        "technique": "T1046 - Network Service Discovery",
+        "sub_technique": "N/A",
+        "url": "https://attack.mitre.org/techniques/T1046/",
+        "description": "Port scanning is commonly used to discover exposed services before exploitation or lateral movement.",
+    },
+    "arp_poisoning": {
+        "tactic": "Credential Access / Lateral Movement",
+        "technique": "T1557 - Adversary-in-the-Middle",
+        "sub_technique": "T1557.002 - ARP Cache Poisoning",
+        "url": "https://attack.mitre.org/techniques/T1557/002/",
+        "description": "ARP poisoning can let an attacker intercept, modify, or disrupt local network traffic by corrupting IP-to-MAC mappings.",
+    },
+    "dos_attack": {
+        "tactic": "Impact",
+        "technique": "T1498 - Network Denial of Service",
+        "sub_technique": "T1498.001 - Direct Network Flood",
+        "url": "https://attack.mitre.org/techniques/T1498/001/",
+        "description": "Network DoS attempts overwhelm a target service or host with traffic and can degrade availability.",
+    },
+}
+
+RECOMMENDED_ACTIONS = {
+    "ssh_bruteforce": [
+        "Block or rate-limit the source IP at the firewall if unauthorized.",
+        "Review SSH authentication logs on the target host.",
+        "Enforce SSH key-based authentication and disable password login where possible.",
+        "Deploy fail2ban or equivalent brute force protection.",
+        "Cross-check the source IP against threat intelligence.",
+    ],
+    "http_login_bruteforce": [
+        "Rate-limit or block the source IP at the WAF or firewall.",
+        "Review web access logs for the targeted login endpoint.",
+        "Enable MFA on exposed login pages.",
+        "Use account lockout or step-up controls after repeated failures.",
+        "Consider CAPTCHA or bot protection for public authentication paths.",
+    ],
+    "port_scan": [
+        "Confirm whether the source is an authorized scanner.",
+        "Block the source IP if the scan is unauthorized.",
+        "Review discovered services and close unnecessary ports.",
+        "Tighten firewall exposure for externally reachable hosts.",
+        "Check whether the scan was followed by exploit or brute force attempts.",
+    ],
+    "arp_poisoning": [
+        "Validate MAC-to-IP mappings using switch ARP tables.",
+        "Enable Dynamic ARP Inspection on managed switches when available.",
+        "Identify hosts that may have received poisoned ARP replies.",
+        "Isolate the offending MAC address at the switch layer.",
+        "Use static ARP entries for critical infrastructure when appropriate.",
+    ],
+    "dos_attack": [
+        "Rate-limit or block the source IP at the network edge.",
+        "Check service health on the targeted host.",
+        "Enable SYN cookies if SYN flood behavior is present.",
+        "Review firewall and load balancer telemetry for traffic volume.",
+        "Escalate to upstream scrubbing if the traffic is volumetric.",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# CSS injection
+# ---------------------------------------------------------------------------
 
 def inject_css():
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
         html, body, [data-testid="stAppViewContainer"] {
-            background: #07111f;
-            color: #e5eef8;
+            background:
+                radial-gradient(circle at top left, rgba(124, 58, 237, 0.28), transparent 34rem),
+                radial-gradient(circle at top right, rgba(6, 182, 212, 0.11), transparent 30rem),
+                #0a0612 !important;
+            font-family: 'Inter', sans-serif !important;
+            color: #f1f0ff !important;
         }
+
+        [data-testid="stHeader"] {
+            background: rgba(10, 6, 18, 0.55) !important;
+            backdrop-filter: blur(12px);
+        }
+
         .block-container {
-            max-width: 1460px;
-            padding-top: 1rem;
-            padding-bottom: 2rem;
+            padding-top: 2rem !important;
+            padding-bottom: 3rem !important;
+            max-width: 1440px !important;
         }
-        [data-testid="stSidebar"] {
-            background: #050b14;
-            border-right: 1px solid #163047;
+
+        h1, h2, h3, h4, h5, h6, p, label,
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stWidgetLabel"],
+        input, textarea, button {
+            font-family: 'Inter', sans-serif !important;
         }
-        [data-testid="stSidebar"] * {
-            color: #e5eef8;
+
+        h1, h2, h3 {
+            color: #f1f0ff !important;
+            letter-spacing: 0 !important;
         }
-        [data-testid="stSidebar"] .stButton > button {
-            background: #00a3a3;
-            color: #04111f;
-            border: 0;
-            border-radius: 8px;
-            font-weight: 850;
-            min-height: 42px;
+
+        p, li, label, [data-testid="stMarkdownContainer"] {
+            color: #a89cc8;
         }
-        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
-            color: #9fb3c8;
+
+        .glass-card {
+            background: rgba(26, 16, 53, 0.72);
+            backdrop-filter: blur(12px);
+            border: 1px solid #2d1f5e;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 24px rgba(124, 58, 237, 0.15);
+            transition: all 0.2s ease;
         }
-        .hero {
-            background: linear-gradient(135deg, #0b1b2b 0%, #102f45 55%, #0b1b2b 100%);
-            border: 1px solid #1e4662;
-            border-radius: 8px;
-            padding: 18px 20px;
-            margin-bottom: 14px;
-            box-shadow: 0 14px 32px rgba(0, 0, 0, 0.28);
+
+        .glass-card:hover {
+            border-color: #4a3080;
+            box-shadow: 0 8px 32px rgba(124, 58, 237, 0.25);
+            transform: translateY(-2px);
         }
-        .hero-row {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 18px;
-        }
-        .brand {
-            color: #f8fbff;
-            font-size: 30px;
-            font-weight: 900;
-            letter-spacing: 0;
-            margin: 0;
-        }
-        .subtitle {
-            color: #b8cadb;
-            font-size: 14px;
-            margin: 5px 0 0 0;
-        }
-        .status-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            justify-content: flex-end;
-        }
-        .pill, .status-pill, .badge {
-            display: inline-flex;
-            align-items: center;
-            border-radius: 8px;
-            padding: 7px 10px;
-            font-size: 12px;
-            font-weight: 850;
-            white-space: nowrap;
-        }
-        .pill {
-            color: #d9e8f7;
-            background: rgba(255, 255, 255, 0.07);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-        }
-        .status-pill, .badge {
-            color: white;
-        }
-        .panel, .card, .alert-card, .upload-card, .drawer {
-            background: #0d1b2a;
-            border: 1px solid #203a52;
-            border-radius: 8px;
-            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
-        }
-        .panel {
-            padding: 15px 17px;
-            margin-bottom: 12px;
-        }
-        .upload-card {
+
+        .glow-card {
+            background: linear-gradient(135deg, rgba(26, 16, 53, 0.92), rgba(10, 6, 18, 0.92));
+            border: 1px solid #7c3aed;
+            border-radius: 12px;
             padding: 22px;
-            margin-bottom: 14px;
+            box-shadow: 0 0 20px rgba(124, 58, 237, 0.30), inset 0 0 20px rgba(124, 58, 237, 0.05);
+            margin-bottom: 16px;
         }
-        .panel-title {
-            color: #f8fbff;
-            font-size: 17px;
+
+        .brand-title {
+            font-size: 34px;
             font-weight: 900;
-            margin: 0 0 7px 0;
+            color: #f1f0ff;
+            line-height: 1;
+            text-shadow: 0 0 24px rgba(192, 132, 252, 0.45);
+            margin: 0 0 8px 0;
         }
-        .panel-copy {
-            color: #9fb3c8;
-            font-size: 13px;
+
+        .brand-subtitle {
+            color: #a89cc8;
+            font-size: 14px;
+            font-weight: 600;
             margin: 0;
         }
-        .kpi {
-            background: #0d1b2a;
-            border: 1px solid #203a52;
-            border-radius: 8px;
-            padding: 15px 16px;
-            min-height: 105px;
+
+        .section-title {
+            color: #f1f0ff;
+            font-size: 18px;
+            font-weight: 800;
+            margin: 0 0 12px 0;
         }
-        .kpi-label {
-            color: #9fb3c8;
-            font-size: 12px;
-            font-weight: 850;
+
+        .tiny-label {
+            color: #6b5fa0;
+            font-size: 11px;
+            font-weight: 800;
             text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .metric-value {
+            color: #f1f0ff;
+            font-size: 20px;
+            font-weight: 900;
+            overflow-wrap: anywhere;
+        }
+
+        .kpi-card {
+            background: linear-gradient(135deg, rgba(26, 16, 53, 0.95), rgba(19, 13, 36, 0.95));
+            border: 1px solid #2d1f5e;
+            border-radius: 12px;
+            padding: 18px 16px;
+            min-height: 108px;
+            transition: all 0.2s ease;
+        }
+
+        .kpi-card:hover {
+            border-color: #7c3aed;
+            box-shadow: 0 0 15px rgba(124, 58, 237, 0.22);
+        }
+
+        .kpi-label {
+            color: #a89cc8;
+            font-size: 11px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
             margin-bottom: 8px;
         }
+
         .kpi-value {
-            color: #f8fbff;
-            font-size: 26px;
+            color: #f1f0ff;
+            font-size: 28px;
             font-weight: 900;
             line-height: 1.08;
             overflow-wrap: anywhere;
         }
+
         .kpi-note {
-            color: #8ca6bd;
+            color: #6b5fa0;
             font-size: 12px;
             margin-top: 6px;
         }
-        .stage-wrap {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .stage {
-            border-radius: 8px;
-            border: 1px solid #203a52;
-            padding: 8px 10px;
-            background: #091525;
-            color: #d9e8f7;
-            font-size: 12px;
-            font-weight: 850;
-        }
-        .stage small {
-            color: #9fb3c8;
-            font-weight: 800;
-            margin-left: 6px;
-        }
-        .alert-card {
-            padding: 14px 15px;
-            margin-bottom: 10px;
-        }
-        .alert-head {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-        .alert-title {
-            color: #f8fbff;
-            font-size: 17px;
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 7px;
+            padding: 5px 10px;
+            font-size: 11px;
             font-weight: 900;
-            margin: 0;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            border: 1px solid currentColor;
+            background: rgba(255, 255, 255, 0.04);
         }
-        .flow {
-            color: #b8cadb;
+
+        .status-completed { color: #10b981; }
+        .status-failed { color: #ef4444; }
+        .status-running { color: #f59e0b; }
+        .status-waiting { color: #a89cc8; }
+
+        @keyframes pulse-border {
+            0%, 100% { box-shadow: 0 0 15px rgba(124, 58, 237, 0.38); }
+            50% { box-shadow: 0 0 30px rgba(124, 58, 237, 0.80); }
+        }
+
+        .progress-container {
+            animation: pulse-border 2s infinite;
+            background: linear-gradient(135deg, #1a1035 0%, #0f0a22 100%);
+            border: 1px solid #7c3aed;
+            border-radius: 16px;
+            padding: 30px;
+            text-align: center;
+            margin: 16px 0;
+        }
+
+        .progress-step {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            background: rgba(124, 58, 237, 0.15);
+            color: #c084fc;
+            border: 1px solid #7c3aed;
+            font-weight: 900;
+            margin-bottom: 12px;
+        }
+
+        .progress-stage-name {
+            font-size: 24px;
+            font-weight: 900;
+            color: #c084fc;
+            margin: 4px 0 6px 0;
+        }
+
+        .progress-stage-desc {
+            color: #a89cc8;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+
+        .stage-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .stage-pill {
+            border: 1px solid #2d1f5e;
+            border-radius: 10px;
+            padding: 10px;
+            background: rgba(10, 6, 18, 0.45);
+        }
+
+        .stage-pill-complete {
+            border-color: rgba(16, 185, 129, 0.7);
+            color: #10b981;
+        }
+
+        .stage-pill-running {
+            border-color: rgba(192, 132, 252, 0.9);
+            color: #c084fc;
+        }
+
+        .stage-pill-pending {
+            color: #6b5fa0;
+        }
+
+        .stage-pill-failed {
+            border-color: rgba(239, 68, 68, 0.72);
+            color: #ef4444;
+        }
+
+        [data-testid="stProgressBar"] > div > div {
+            background: linear-gradient(90deg, #7c3aed, #a855f7, #c084fc) !important;
+            border-radius: 4px !important;
+        }
+
+        .threat-number {
+            font-size: 56px;
+            font-weight: 900;
+            line-height: 0.95;
+            margin: 6px 0;
+        }
+
+        .threat-score-high { color: #ef4444; }
+        .threat-score-medium { color: #f59e0b; }
+        .threat-score-low { color: #10b981; }
+
+        .threat-track {
+            height: 12px;
+            border-radius: 999px;
+            background: #130d24;
+            overflow: hidden;
+            border: 1px solid #2d1f5e;
+            margin-top: 12px;
+        }
+
+        .threat-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #10b981, #f59e0b, #ef4444);
+        }
+
+        .severity-card {
+            background: rgba(26, 16, 53, 0.72);
+            border: 1px solid #2d1f5e;
+            border-radius: 12px;
+            padding: 18px;
+            min-height: 352px;
+        }
+
+        .sev-bar-container { margin-bottom: 18px; }
+        .sev-bar-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
             font-size: 13px;
             font-weight: 800;
-            margin-top: 4px;
+            color: #f1f0ff;
         }
-        .evidence {
-            color: #d9e8f7;
-            font-size: 14px;
-            margin: 8px 0 0 0;
+        .sev-bar-track {
+            background: #130d24;
+            border: 1px solid #2d1f5e;
+            border-radius: 999px;
+            height: 11px;
+            overflow: hidden;
         }
+        .sev-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            transition: width 0.6s ease;
+        }
+
+        .evidence-box {
+            background: rgba(10, 6, 18, 0.50);
+            border: 1px solid #2d1f5e;
+            border-radius: 12px;
+            padding: 16px;
+            color: #f1f0ff;
+            margin-bottom: 14px;
+            line-height: 1.55;
+        }
+
         .mini-grid {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 8px;
-            margin-top: 10px;
+            gap: 10px;
+            margin-bottom: 14px;
         }
-        .mini {
-            background: #091525;
-            border: 1px solid #203a52;
-            border-radius: 8px;
-            padding: 8px 10px;
+
+        .mini-cell {
+            background: rgba(10, 6, 18, 0.40);
+            border: 1px solid #2d1f5e;
+            border-radius: 10px;
+            padding: 12px;
         }
-        .mini-label {
-            color: #9fb3c8;
-            font-size: 11px;
-            font-weight: 850;
-            text-transform: uppercase;
+
+        .mitre-card {
+            background: linear-gradient(135deg, rgba(124, 58, 237, 0.16), rgba(19, 13, 36, 0.90));
+            border: 1px solid #4a3080;
+            border-radius: 12px;
+            padding: 18px;
+            margin: 12px 0;
         }
-        .mini-value {
-            color: #f8fbff;
-            font-size: 13px;
-            font-weight: 850;
+
+        .mitre-technique-id {
+            font-size: 21px;
+            font-weight: 900;
+            color: #c084fc;
+            margin-bottom: 8px;
+        }
+
+        .action-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 10px 0;
+            border-bottom: 1px solid #1a1035;
+            color: #f1f0ff;
+            font-size: 14px;
+        }
+
+        .check-box {
+            width: 16px;
+            height: 16px;
+            min-width: 16px;
+            border-radius: 5px;
+            border: 1px solid #7c3aed;
+            background: rgba(124, 58, 237, 0.18);
             margin-top: 2px;
-            overflow-wrap: anywhere;
         }
-        .drawer {
-            padding: 15px 16px;
-            position: sticky;
-            top: 12px;
+
+        .warning-card {
+            background: rgba(245, 158, 11, 0.09);
+            border: 1px solid rgba(245, 158, 11, 0.45);
+            border-radius: 12px;
+            padding: 16px;
+            color: #ffe6b0;
+            margin-top: 12px;
         }
-        .drawer-block {
-            background: #091525;
-            border: 1px solid #203a52;
-            border-radius: 8px;
-            padding: 11px 12px;
-            margin-bottom: 10px;
+
+        .alert-shell {
+            border-left: 4px solid var(--severity-color);
+            border-radius: 12px;
         }
-        .drawer-title {
-            color: #7dd3fc;
-            font-size: 12px;
-            font-weight: 900;
-            text-transform: uppercase;
-            margin-bottom: 7px;
+
+        [data-testid="stExpander"] {
+            background: rgba(26, 16, 53, 0.58) !important;
+            border: 1px solid #2d1f5e !important;
+            border-radius: 12px !important;
+            overflow: hidden !important;
         }
-        .drawer-copy {
-            color: #d9e8f7;
+
+        [data-testid="stExpander"]:hover {
+            border-color: #7c3aed !important;
+            box-shadow: 0 0 18px rgba(124, 58, 237, 0.20);
+        }
+
+        [data-testid="stExpander"] summary {
+            color: #f1f0ff !important;
+            font-weight: 800 !important;
+        }
+
+        [data-testid="stSidebar"] {
+            background: #0d0820 !important;
+            border-right: 1px solid #2d1f5e !important;
+        }
+
+        [data-testid="stSidebar"] * {
+            color: #f1f0ff;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown p,
+        [data-testid="stSidebar"] li {
+            color: #a89cc8;
             font-size: 13px;
-            margin: 0;
         }
-        .coverage-card {
-            background: #0d1b2a;
-            border: 1px solid #203a52;
-            border-radius: 8px;
-            padding: 13px 15px;
-            margin-bottom: 10px;
+
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 8px;
         }
-        .coverage-title {
-            color: #f8fbff;
-            font-weight: 900;
-            margin-bottom: 5px;
+
+        [data-testid="stTabs"] [data-baseweb="tab"] {
+            background: rgba(26, 16, 53, 0.70);
+            border: 1px solid #2d1f5e;
+            border-radius: 10px;
+            color: #a89cc8;
+            font-size: 14px;
+            font-weight: 800;
+            padding: 10px 16px;
         }
-        .coverage-copy {
-            color: #b8cadb;
-            font-size: 13px;
-            margin: 0;
+
+        [data-testid="stTabs"] [aria-selected="true"] {
+            background: linear-gradient(135deg, rgba(124, 58, 237, 0.28), rgba(26, 16, 53, 0.88));
+            border-color: #7c3aed;
+            color: #f1f0ff;
         }
-        @media (max-width: 950px) {
-            .hero-row, .alert-head {
-                display: block;
-            }
-            .status-row {
-                justify-content: flex-start;
-                margin-top: 12px;
-            }
-            .mini-grid {
+
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 9px !important;
+            border: 1px solid #7c3aed !important;
+            background: linear-gradient(135deg, #7c3aed, #5b21b6) !important;
+            color: #f1f0ff !important;
+            font-weight: 900 !important;
+            transition: all 0.2s ease !important;
+        }
+
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            box-shadow: 0 0 18px rgba(124, 58, 237, 0.45) !important;
+            transform: translateY(-1px);
+        }
+
+        .stSelectbox, .stTextInput, .stFileUploader {
+            color: #f1f0ff !important;
+        }
+
+        .stDataFrame {
+            border: 1px solid #2d1f5e;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        a { color: #c084fc !important; }
+
+        @media (max-width: 900px) {
+            .stage-grid, .mini-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .threat-number {
+                font-size: 42px;
             }
         }
         </style>
@@ -300,9 +629,13 @@ def inject_css():
     )
 
 
-def safe_text(value):
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def safe_text(value, default="-"):
     if value is None or value == "":
-        return "N/A"
+        return default
     return html.escape(str(value))
 
 
@@ -310,114 +643,116 @@ def format_number(value):
     try:
         return f"{int(value):,}"
     except (TypeError, ValueError):
-        return str(value or 0)
+        return "0"
 
 
 def format_bytes(value):
-    if value is None:
-        return "N/A"
-    size = float(value)
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size < 1024:
-            return f"{size:.1f} {unit}"
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
         size /= 1024
-    return f"{size:.1f} TB"
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.2f} {units[idx]}"
 
 
 def format_duration(seconds):
     if seconds is None:
-        return "N/A"
-    if seconds < 1:
-        return f"{seconds:.3f}s"
-    if seconds < 60:
-        return f"{seconds:.2f}s"
-    minutes = int(seconds // 60)
-    remaining = seconds % 60
-    return f"{minutes}m {remaining:.1f}s"
+        return "-"
+    try:
+        total = float(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    if total < 0:
+        return "-"
+    if total < 1:
+        return f"{total * 1000:.0f} ms"
+    if total < 60:
+        return f"{total:.2f} sec"
+    minutes, sec = divmod(int(total), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {sec}s"
+    return f"{minutes}m {sec}s"
 
 
 def format_time(value):
-    if value is None:
-        return "N/A"
+    if value is None or value == "":
+        return "-"
     try:
-        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
+        numeric = float(value)
+        return datetime.fromtimestamp(numeric).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, OSError):
-        return str(value)
-
-
-def severity_color(severity):
-    return {
-        "HIGH": "#ef4444",
-        "MEDIUM": "#f59e0b",
-        "LOW": "#22c55e",
-    }.get(str(severity).upper(), "#64748b")
-
-
-def method_color(method):
-    return {
-        "hybrid": "#8b5cf6",
-        "signature": "#06b6d4",
-        "behavior": "#f97316",
-    }.get(str(method).lower(), "#64748b")
-
-
-def status_color(status):
-    return {
-        "Completed": "#22c55e",
-        "Running": "#06b6d4",
-        "Failed": "#ef4444",
-        "Pending": "#64748b",
-    }.get(status, "#64748b")
-
-
-def badge(text, color):
-    return f"<span class='badge' style='background:{color};'>{safe_text(text)}</span>"
-
-
-def status_badge(text):
-    return f"<span class='status-pill' style='background:{status_color(text)};'>{safe_text(text)}</span>"
+        pass
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text
 
 
 def format_key(key):
-    return str(key).replace("_", " ").title()
+    return str(key).replace("_", " ").strip().title()
 
 
-def attack_label(attack_type):
-    labels = {attack["id"]: attack["name"] for attack in ATTACK_REGISTRY}
-    labels.update({
-        "dos_attack": "DoS",
-        "port_scan": "Port Scan",
-        "arp_poisoning": "ARP Poisoning",
-        "ssh_bruteforce": "SSH Brute Force",
-        "http_login_bruteforce": "HTTP Login Brute Force",
-    })
-    return labels.get(attack_type, format_key(attack_type))
+def severity_color(severity):
+    return SEVERITY_COLORS.get(str(severity or "UNKNOWN").upper(), SEVERITY_COLORS["UNKNOWN"])
 
 
-def save_uploaded_file(uploaded_file):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in uploaded_file.name)
-    save_path = UPLOAD_DIR / f"{timestamp}_{safe_name}"
-    with open(save_path, "wb") as file:
-        file.write(uploaded_file.getbuffer())
-    return str(save_path)
+def method_color(method):
+    return METHOD_COLORS.get(str(method or "unknown").lower(), METHOD_COLORS["unknown"])
 
 
-def environment_status():
-    try:
-        tshark_path = get_tshark_path()
-        tshark = f"TShark ready: {Path(tshark_path).name}"
-    except Exception:
-        tshark = "TShark not found"
-    vt = "VirusTotal enabled" if os.getenv("VT_API_KEY") else "VirusTotal key not set"
-    return tshark, vt
+def badge(label, color):
+    label = safe_text(str(label or "UNKNOWN").upper())
+    return f'<span class="badge" style="color:{color};">{label}</span>'
+
+
+def section_card(title, body):
+    return f"""
+    <div class="glass-card">
+        <div class="section-title">{safe_text(title)}</div>
+        {body}
+    </div>
+    """
+
+
+# ---------------------------------------------------------------------------
+# Analysis helpers
+# ---------------------------------------------------------------------------
+
+def init_session_state():
+    defaults = {
+        "analysis_result": None,
+        "analysis_status": "waiting",
+        "pcap_file_name": None,
+        "pcap_file_size": None,
+        "processing_time": None,
+        "capture_metadata": {},
+        "analysis_timestamp": None,
+        "severity_filter": "ALL",
+        "method_filter": "ALL",
+        "attack_filter": "ALL",
+        "ip_filter": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
 def read_jsonl(path):
     if not path or not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as file:
-        for line in file:
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
             try:
                 yield json.loads(line)
             except json.JSONDecodeError:
@@ -432,11 +767,13 @@ def derive_capture_metadata(result):
 
     for event in read_jsonl(events_path) or []:
         event_count += 1
-        timestamp = event_timestamp(event)
-        if timestamp is None:
+        ts = event_timestamp(event)
+        if ts is None:
             continue
-        first_ts = timestamp if first_ts is None else min(first_ts, timestamp)
-        last_ts = timestamp if last_ts is None else max(last_ts, timestamp)
+        if first_ts is None or ts < first_ts:
+            first_ts = ts
+        if last_ts is None or ts > last_ts:
+            last_ts = ts
 
     duration = None
     if first_ts is not None and last_ts is not None:
@@ -446,147 +783,358 @@ def derive_capture_metadata(result):
         "first_packet_time": first_ts,
         "last_packet_time": last_ts,
         "capture_duration": duration,
-        "event_count": event_count or result.get("packet_count", 0) if result else 0,
+        "event_count": event_count or (result or {}).get("packet_count", 0),
     }
 
 
-def run_analysis(uploaded_file):
-    st.session_state["analysis_status"] = "Running"
-    st.session_state["pcap_file_name"] = uploaded_file.name
-    st.session_state["pcap_file_size"] = uploaded_file.size
-    save_path = save_uploaded_file(uploaded_file)
-
-    start = time.perf_counter()
-    with st.spinner("Analyzing uploaded PCAP..."):
-        try:
-            result = run_pipeline(save_path)
-        except Exception:
-            result = {
-                "success": False,
-                "alerts": [],
-                "errors": [{
-                    "stage": "application",
-                    "message": "Analysis failed unexpectedly.",
-                    "details": traceback.format_exc(),
-                }],
-            }
-
-    st.session_state["processing_time"] = time.perf_counter() - start
-    st.session_state["analysis_result"] = result
-    st.session_state["capture_metadata"] = derive_capture_metadata(result)
-    st.session_state["analysis_status"] = "Completed" if result.get("success") else "Failed"
+def save_uploaded_file(uploaded_file):
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(uploaded_file.name).name
+    destination = UPLOAD_DIR / f"{int(time.time())}_{safe_name}"
+    with open(destination, "wb") as handle:
+        handle.write(uploaded_file.getbuffer())
+    return str(destination)
 
 
-def render_upload_card(after_analysis=False):
-    title = "Analyze Another PCAP" if after_analysis else "Drag & Drop PCAP"
-    copy = "Upload a new capture to replace the current analysis run." if after_analysis else "Browse or drop a .pcap/.pcapng file, then start the forensic analysis."
+def environment_status():
+    try:
+        tshark_path = get_tshark_path()
+        tshark_status = f"Ready: {tshark_path}"
+    except Exception as error:
+        tshark_status = f"Missing: {error}"
 
-    st.markdown(
-        f"""
-        <div class="upload-card">
-            <p class="panel-title">{safe_text(title)}</p>
-            <p class="panel-copy">{safe_text(copy)}</p>
-            <p class="panel-copy">Supported formats: .pcap, .pcapng</p>
-        </div>
-        """,
+    vt_key = os.getenv("VT_API_KEY") or os.getenv("VIRUSTOTAL_API_KEY")
+    vt_status = "Configured" if vt_key else "Optional key not configured"
+    return tshark_status, vt_status
+
+
+def registry_name(attack_id):
+    for attack in ATTACK_REGISTRY:
+        if attack.get("id") == attack_id:
+            return attack.get("name", attack_id)
+    return attack_id or "Unknown"
+
+
+def normalize_attack_name(alert):
+    return alert.get("alert_type") or registry_name(alert.get("attack_type")) or "Unknown Alert"
+
+
+def counts_by(alerts, field):
+    counter = Counter()
+    for alert in alerts:
+        value = alert.get(field) or "unknown"
+        counter[str(value)] += 1
+    return counter
+
+
+def suspicious_hosts(alerts):
+    counter = Counter()
+    for alert in alerts:
+        src_ip = alert.get("src_ip")
+        if src_ip:
+            counter[src_ip] += 1
+    return counter
+
+
+def unique_sources(alerts):
+    return {alert.get("src_ip") for alert in alerts if alert.get("src_ip")}
+
+
+def collect_hosts_from_summary(result):
+    summary = (result or {}).get("detection_summary") or {}
+    hosts = summary.get("host_profiles") or []
+    return {row.get("src_ip") or row.get("ip") for row in hosts if row.get("src_ip") or row.get("ip")}
+
+
+def normalize_table_rows(rows, columns, rename):
+    output = []
+    for row in rows or []:
+        normalized = {}
+        for column in columns:
+            label = rename.get(column, format_key(column))
+            normalized[label] = row.get(column, "-")
+        output.append(normalized)
+    return output
+
+
+def arp_identity_rows(summary):
+    arp_identity = (summary or {}).get("arp_identity") or {}
+    rows = []
+
+    for ip_address, mac_values in sorted(arp_identity.items()):
+        if isinstance(mac_values, str):
+            macs = [mac_values]
+        else:
+            macs = sorted(str(mac) for mac in (mac_values or []) if mac)
+
+        mac_count = len(set(macs))
+        status = "Stable" if mac_count <= 1 else "Possible ARP Spoofing"
+        rows.append({
+            "IP Address": ip_address,
+            "MAC Addresses": ", ".join(macs) if macs else "-",
+            "MAC Count": mac_count,
+            "Status": status,
+        })
+
+    return rows
+
+
+def alerts_to_csv(alerts, run_id=None):
+    export_run_id = run_id or "unknown"
+    fields = [
+        "run_id",
+        "alert_type",
+        "attack_type",
+        "severity",
+        "confidence",
+        "detection_method",
+        "src_ip",
+        "dst_ip",
+        "evidence",
+        "recommendation",
+        "limitations",
+    ]
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for alert in alerts:
+        row = {field: alert.get(field, "") for field in fields}
+        row["run_id"] = export_run_id
+        writer.writerow(row)
+    return output.getvalue()
+
+
+def filter_alerts(alerts, severity, method, attack_type, ip_search):
+    ip_search = (ip_search or "").strip().lower()
+    filtered = []
+    for alert in alerts:
+        alert_severity = str(alert.get("severity") or "UNKNOWN").upper()
+        alert_method = str(alert.get("detection_method") or "unknown").lower()
+        alert_attack = alert.get("attack_type") or alert.get("alert_type") or "unknown"
+
+        if severity != "ALL" and alert_severity != severity:
+            continue
+        if method != "ALL" and alert_method != method.lower():
+            continue
+        if attack_type != "ALL" and str(alert_attack) != attack_type:
+            continue
+        if ip_search:
+            src = str(alert.get("src_ip") or "").lower()
+            dst = str(alert.get("dst_ip") or "").lower()
+            if ip_search not in src and ip_search not in dst:
+                continue
+        filtered.append(alert)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Threat score
+# ---------------------------------------------------------------------------
+
+def compute_threat_score(alerts):
+    if not alerts:
+        return 0
+    score = 0
+    for alert in alerts:
+        severity = str(alert.get("severity") or "").upper()
+        method = str(alert.get("detection_method") or "").lower()
+        if severity == "HIGH":
+            score += 30
+        elif severity == "MEDIUM":
+            score += 15
+        else:
+            score += 5
+        if method == "hybrid":
+            score += 10
+        elif method == "behavior":
+            score += 5
+    return min(100, score)
+
+
+def threat_label(score):
+    if score >= 85:
+        return "CRITICAL"
+    if score >= 70:
+        return "HIGH RISK"
+    if score > 40:
+        return "MODERATE"
+    return "LOW RISK"
+
+
+def threat_class(score):
+    if score > 70:
+        return "threat-score-high"
+    if score > 40:
+        return "threat-score-medium"
+    return "threat-score-low"
+
+
+# ---------------------------------------------------------------------------
+# Upload and progress
+# ---------------------------------------------------------------------------
+
+def render_progress_stage(stage_index, status_text, progress_slot, bar_slot, log_slot):
+    number, name, description = PIPELINE_STAGES[stage_index]
+    percentage = (stage_index + 1) / len(PIPELINE_STAGES)
+
+    progress_slot.markdown(
+        '<div class="progress-container">'
+        f'<div class="progress-step">{safe_text(number)}</div>'
+        f'<div class="progress-stage-name">{safe_text(name)}</div>'
+        f'<div class="progress-stage-desc">{safe_text(description)}</div>'
+        f'<div class="tiny-label">{safe_text(status_text)}</div>'
+        "</div>",
         unsafe_allow_html=True,
     )
-    uploaded_file = st.file_uploader("Browse File", type=["pcap", "pcapng"], key="pcap_upload")
-    if st.button("Start Analysis", use_container_width=True, disabled=uploaded_file is None):
-        run_analysis(uploaded_file)
+    bar_slot.progress(percentage)
+
+    stage_cards = []
+    for idx, (_, stage_name, _) in enumerate(PIPELINE_STAGES):
+        if idx < stage_index:
+            cls = "stage-pill stage-pill-complete"
+            state = "Completed"
+        elif idx == stage_index:
+            cls = "stage-pill stage-pill-running"
+            state = "Running"
+        else:
+            cls = "stage-pill stage-pill-pending"
+            state = "Pending"
+        stage_cards.append(
+            f'<div class="{cls}">'
+            f'<div class="tiny-label">{safe_text(stage_name)}</div>'
+            f'<div style="font-weight:900;margin-top:4px;">{safe_text(state)}</div>'
+            "</div>"
+        )
+    log_slot.markdown(f'<div class="stage-grid">{"".join(stage_cards)}</div>', unsafe_allow_html=True)
+
+
+def run_analysis_with_progress(uploaded_file):
+    st.session_state.analysis_status = "running"
+    st.session_state.pcap_file_name = uploaded_file.name
+    st.session_state.pcap_file_size = uploaded_file.size
+    st.session_state.analysis_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    progress_slot = st.empty()
+    bar_slot = st.empty()
+    log_slot = st.empty()
+    result = None
+    start_time = time.perf_counter()
+
+    try:
+        saved_path = None
+        for idx, (_, stage_name, _) in enumerate(PIPELINE_STAGES):
+            render_progress_stage(idx, "Pipeline Execution Summary", progress_slot, bar_slot, log_slot)
+            time.sleep(0.45)
+
+            if stage_name == "Upload":
+                saved_path = save_uploaded_file(uploaded_file)
+
+            if stage_name == "Hybrid Correlation":
+                result = run_pipeline(saved_path)
+
+        elapsed = time.perf_counter() - start_time
+        st.session_state.processing_time = elapsed
+        st.session_state.analysis_result = result
+        st.session_state.capture_metadata = derive_capture_metadata(result)
+        st.session_state.analysis_status = "completed" if result and result.get("success") else "failed"
+
+        if result and result.get("success"):
+            progress_slot.success("Analysis complete. Preparing dashboard...")
+        else:
+            progress_slot.error("Analysis failed. Preparing error details...")
+        time.sleep(0.8)
+        st.rerun()
+    except Exception as error:
+        elapsed = time.perf_counter() - start_time
+        st.session_state.processing_time = elapsed
+        st.session_state.analysis_status = "failed"
+        st.session_state.analysis_result = {
+            "success": False,
+            "run_id": None,
+            "packet_count": 0,
+            "alerts": [],
+            "stats": {},
+            "detection_summary": {},
+            "events_path": None,
+            "errors": [
+                {
+                    "stage": "dashboard",
+                    "message": str(error),
+                    "details": traceback.format_exc(),
+                }
+            ],
+        }
+        st.session_state.capture_metadata = {}
+        progress_slot.error("Analysis failed. Preparing error details...")
+        time.sleep(0.8)
         st.rerun()
 
 
-def render_waiting_panel():
-    st.markdown(
-        """
-        <div class="panel">
-            <p class="panel-title">No PCAP Analysis Yet</p>
-            <p class="panel-copy">Upload a PCAP from the analysis card above to populate this section.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def render_upload_card(after_analysis=False):
+    title = "Analyze Another PCAP" if after_analysis else "Drag and Drop PCAP"
+    subtitle = (
+        "Upload a new capture to create a fresh forensic analysis run."
+        if after_analysis
+        else "Upload a .pcap or .pcapng capture and run the Hybrid IDS pipeline."
     )
-
-
-def render_sidebar():
-    tshark, vt = environment_status()
-    with st.sidebar:
-        st.markdown("## AutoNetIR")
-        st.caption("Forensic PCAP Analysis Dashboard")
-        st.markdown("### Detection Mode")
-        st.markdown("- Hybrid IDS")
-        st.markdown("- Signature + Behavior")
-        st.markdown("- Time-window evidence")
-        st.markdown("### Supported Attacks")
-        for attack in ATTACK_REGISTRY:
-            st.markdown(f"- {attack_label(attack['id'])}")
-        st.markdown("### Environment")
-        st.caption(tshark)
-        st.caption(vt)
-
-
-def current_status(result):
-    if st.session_state.get("analysis_status") == "Running":
-        return "Running"
-    if result and result.get("success"):
-        return "Completed"
-    if result and not result.get("success"):
-        return "Failed"
-    return "Pending"
-
-
-def render_header(result):
-    metadata = st.session_state.get("capture_metadata", {})
-    status = current_status(result)
-    file_name = st.session_state.get("pcap_file_name", "No PCAP analyzed")
-    file_size = st.session_state.get("pcap_file_size")
-    processing_time = st.session_state.get("processing_time")
-    packet_count = result.get("packet_count", 0) if result else 0
-    alert_count = len(result.get("alerts", [])) if result else 0
-
     st.markdown(
         f"""
-        <div class="hero">
-            <div class="hero-row">
-                <div>
-                    <h1 class="brand">Analysis Run Overview</h1>
-                    <p class="subtitle">AutoNetIR analyzes uploaded PCAP files and reports forensic IDS findings. This is not live traffic monitoring.</p>
-                </div>
-                <div class="status-row">
-                    {status_badge(status)}
-                    <span class="pill">Detection Mode: Hybrid IDS</span>
-                    <span class="pill">Run: {safe_text(result.get("run_id", "No run yet") if result else "No run yet")}</span>
-                </div>
+        <div class="glow-card">
+            <div class="brand-title">{safe_text(title)}</div>
+            <p class="brand-subtitle">{safe_text(subtitle)}</p>
+            <div style="margin-top:14px;">
+                {badge("Supported formats: .pcap, .pcapng", "#c084fc")}
+                {badge("Detection Mode: Hybrid IDS", "#06b6d4")}
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    cols = st.columns(4)
-    with cols[0]:
-        kpi_card("PCAP File", file_name, format_bytes(file_size), "#7dd3fc")
-    with cols[1]:
-        kpi_card("Capture Duration", format_duration(metadata.get("capture_duration")), "First to last packet", "#22c55e")
-    with cols[2]:
-        kpi_card("Total Packets / Events", format_number(packet_count or metadata.get("event_count", 0)), "Parsed from uploaded PCAP", "#f8fbff")
-    with cols[3]:
-        kpi_card("Processing Time", format_duration(processing_time), f"{alert_count} detected alert(s)", "#f59e0b")
-
-    cols = st.columns(2)
-    with cols[0]:
-        info_panel("First Packet Time", format_time(metadata.get("first_packet_time")))
-    with cols[1]:
-        info_panel("Last Packet Time", format_time(metadata.get("last_packet_time")))
+    uploaded_file = st.file_uploader(
+        "Browse File",
+        type=["pcap", "pcapng"],
+        key="pcap_upload",
+        help="Upload a PCAP or PCAPNG file for forensic analysis.",
+    )
+    start_disabled = uploaded_file is None or st.session_state.analysis_status == "running"
+    if st.button("Start Analysis", type="primary", disabled=start_disabled, width="stretch"):
+        run_analysis_with_progress(uploaded_file)
 
 
-def kpi_card(label, value, note="", color="#f8fbff"):
+# ---------------------------------------------------------------------------
+# Header and KPIs
+# ---------------------------------------------------------------------------
+
+def render_landing_header():
+    st.markdown(
+        """
+        <div class="glow-card">
+            <div class="brand-title">AutoNetIR</div>
+            <p class="brand-subtitle">Purple DFIR dashboard for forensic PCAP analysis with Hybrid IDS correlation.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_status_badge():
+    status = st.session_state.analysis_status
+    if status == "completed":
+        return '<span class="badge status-completed">Completed</span>'
+    if status == "failed":
+        return '<span class="badge status-failed">Failed</span>'
+    if status == "running":
+        return '<span class="badge status-running">Running</span>'
+    return '<span class="badge status-waiting">Waiting</span>'
+
+
+def render_kpi(label, value, note="-"):
     st.markdown(
         f"""
-        <div class="kpi">
+        <div class="kpi-card">
             <div class="kpi-label">{safe_text(label)}</div>
-            <div class="kpi-value" style="color:{color};">{safe_text(value)}</div>
+            <div class="kpi-value">{safe_text(value)}</div>
             <div class="kpi-note">{safe_text(note)}</div>
         </div>
         """,
@@ -594,93 +1142,579 @@ def kpi_card(label, value, note="", color="#f8fbff"):
     )
 
 
-def info_panel(title, copy):
+def render_run_overview(result):
+    alerts = result.get("alerts") or []
+    metadata = st.session_state.capture_metadata or {}
+    score = compute_threat_score(alerts)
+    score_cls = threat_class(score)
+    method_counts = counts_by(alerts, "detection_method")
+    high_count = sum(1 for alert in alerts if str(alert.get("severity") or "").upper() == "HIGH")
+    suspicious_count = len(unique_sources(alerts) or collect_hosts_from_summary(result))
+    packet_count = result.get("packet_count") or metadata.get("event_count") or 0
+
+    left, right = st.columns([2.4, 1])
+    with left:
+        st.markdown(
+            f"""
+            <div class="glow-card">
+                <div class="tiny-label">Analysis Run Overview</div>
+                <div class="brand-title">AutoNetIR Forensic PCAP Analysis</div>
+                <p class="brand-subtitle">Run ID: <b>{safe_text(result.get("run_id"))}</b></p>
+                <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap;">
+                    {render_status_badge()}
+                    {badge("Hybrid IDS", "#06b6d4")}
+                    {badge(safe_text(st.session_state.get("pcap_file_name") or "No file"), "#c084fc")}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            f"""
+            <div class="glow-card">
+                <div class="tiny-label">Threat Score</div>
+                <div class="threat-number {score_cls}">{score}</div>
+                <div class="metric-value">{safe_text(threat_label(score))}</div>
+                <div class="threat-track"><div class="threat-fill" style="width:{score}%;"></div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    kpis = st.columns(4)
+    with kpis[0]:
+        render_kpi("Total Packets", format_number(packet_count), "Events parsed from PCAP")
+    with kpis[1]:
+        render_kpi("Total Alerts", format_number(len(alerts)), "Detected alerts")
+    with kpis[2]:
+        render_kpi("High Severity", format_number(high_count), "Requires priority triage")
+    with kpis[3]:
+        render_kpi("Capture Duration", format_duration(metadata.get("capture_duration")), "First packet to last packet")
+
+    kpis2 = st.columns(4)
+    with kpis2[0]:
+        render_kpi("Hybrid Alerts", format_number(method_counts.get("hybrid", 0)), "Signature + behavior")
+    with kpis2[1]:
+        render_kpi("Signature Alerts", format_number(method_counts.get("signature", 0)), "Known rule evidence")
+    with kpis2[2]:
+        render_kpi("Behavior Alerts", format_number(method_counts.get("behavior", 0)), "Peer-baseline anomaly")
+    with kpis2[3]:
+        render_kpi("Suspicious Hosts", format_number(suspicious_count), "Hosts tied to alerts")
+
+    meta_cols = st.columns(4)
+    with meta_cols[0]:
+        render_kpi("File Size", format_bytes(st.session_state.get("pcap_file_size")), "Uploaded capture")
+    with meta_cols[1]:
+        render_kpi("First Packet", format_time(metadata.get("first_packet_time")), "Capture start")
+    with meta_cols[2]:
+        render_kpi("Last Packet", format_time(metadata.get("last_packet_time")), "Capture end")
+    with meta_cols[3]:
+        render_kpi("Processing Time", format_duration(st.session_state.get("processing_time")), "Pipeline runtime")
+
+
+def render_pipeline_summary(failed=False):
+    status = st.session_state.analysis_status
+    cards = []
+    for _, stage_name, _ in PIPELINE_STAGES:
+        if failed:
+            cls = "stage-pill stage-pill-failed"
+            state = "Failed"
+        elif status == "completed":
+            cls = "stage-pill stage-pill-complete"
+            state = "Completed"
+        elif status == "running":
+            cls = "stage-pill stage-pill-running"
+            state = "Running"
+        else:
+            cls = "stage-pill stage-pill-pending"
+            state = "Pending"
+        cards.append(
+            f'<div class="{cls}">'
+            f'<div class="tiny-label">{safe_text(stage_name)}</div>'
+            f'<div style="font-weight:900;margin-top:4px;">{safe_text(state)}</div>'
+            "</div>"
+        )
+    st.markdown(
+        '<div class="glass-card">'
+        '<div class="section-title">Pipeline Execution Summary</div>'
+        f'<div class="stage-grid">{"".join(cards)}</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
+
+def empty_chart(message):
     st.markdown(
         f"""
-        <div class="panel">
-            <p class="panel-title">{safe_text(title)}</p>
-            <p class="panel-copy">{safe_text(copy)}</p>
+        <div class="glass-card" style="min-height:320px;display:flex;align-items:center;justify-content:center;text-align:center;">
+            <div>
+                <div class="section-title">No data available</div>
+                <p>{safe_text(message)}</p>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def stage_statuses(result):
-    if not result:
-        return {stage: "Pending" for stage in PIPELINE_STAGES}
-    if result.get("success"):
-        return {stage: "Completed" for stage in PIPELINE_STAGES}
+def donut_chart(labels, values, title, colors=None, hole=0.58):
+    if not labels or not values or sum(values) == 0:
+        return None
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=hole,
+                marker=dict(colors=colors or CHART_COLORS),
+                textinfo="label+percent",
+                hovertemplate="<b>%{label}</b><br>Count: %{value}<br>%{percent}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(**PLOTLY_LAYOUT, title=dict(text=title, font=dict(color="#f1f0ff", size=18)))
+    return fig
 
-    statuses = {stage: "Pending" for stage in PIPELINE_STAGES}
-    statuses["Upload"] = "Completed"
-    first_error = (result.get("errors") or [{}])[0].get("stage", "")
-    failed_stage = {
-        "parser": "Parse",
-        "detector": "Hybrid Correlation",
-        "enrichment": "Enrichment",
-        "application": "Results",
-    }.get(first_error, "Results")
-    for stage in PIPELINE_STAGES:
-        if stage == failed_stage:
-            statuses[stage] = "Failed"
+
+def horizontal_bar_chart(rows, title, color="#7c3aed", x_title="Count"):
+    clean_rows = [(str(label), int(value)) for label, value in rows if value is not None]
+    if not clean_rows:
+        return None
+    labels = [row[0] for row in clean_rows][::-1]
+    values = [row[1] for row in clean_rows][::-1]
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=values,
+                y=labels,
+                orientation="h",
+                marker=dict(color=color, line=dict(color="#c084fc", width=1)),
+                hovertemplate="<b>%{y}</b><br>" + x_title + ": %{x}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        **PLOTLY_LAYOUT,
+        title=dict(text=title, font=dict(color="#f1f0ff", size=18)),
+        xaxis=dict(title=x_title, gridcolor="rgba(168,156,200,0.12)", color="#a89cc8"),
+        yaxis=dict(color="#a89cc8"),
+        showlegend=False,
+        height=352,
+    )
+    return fig
+
+
+def render_plotly_or_empty(fig, message):
+    if fig is None:
+        empty_chart(message)
+    else:
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+def render_severity_breakdown(alerts):
+    total = max(1, len(alerts))
+    counts = counts_by(alerts, "severity")
+    rows = []
+    for severity in ["HIGH", "MEDIUM", "LOW"]:
+        count = counts.get(severity, 0)
+        percent = (count / total) * 100
+        color = severity_color(severity)
+        dot = (
+            f'<span style="display:inline-block;width:8px;height:8px;'
+            f'border-radius:999px;background:{color};margin-right:8px;"></span>'
+        )
+        rows.append(
+            '<div class="sev-bar-container">'
+            '<div class="sev-bar-label">'
+            f"<span>{dot}{severity}</span>"
+            f"<span>{count}</span>"
+            "</div>"
+            f'<div class="sev-bar-track"><div class="sev-bar-fill" style="width:{percent:.1f}%;background:{color};"></div></div>'
+            "</div>"
+        )
+    st.markdown(
+        '<div class="severity-card">'
+        '<div class="section-title">Severity Breakdown</div>'
+        f'{"".join(rows)}'
+        '<p style="color:#6b5fa0;font-size:12px;margin-top:22px;">Percentages are based on the currently analyzed PCAP alerts.</p>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Alert rendering
+# ---------------------------------------------------------------------------
+
+def evidence_dict(alert):
+    signature = alert.get("signature_evidence") or {}
+    behavior = alert.get("behavior_evidence") or {}
+    return signature, behavior
+
+
+def first_present(*values):
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def time_window_info(alert):
+    signature, behavior = evidence_dict(alert)
+    source = signature if signature else behavior
+    window_seconds = first_present(signature.get("window_seconds"), behavior.get("window_seconds"))
+    window_start = first_present(signature.get("window_start"), behavior.get("window_start"))
+    window_end = first_present(signature.get("window_end"), behavior.get("window_end"))
+
+    basis = alert.get("detection_basis") or source.get("detection_basis") or "time_window_signature"
+    threshold = first_present(signature.get("threshold"), behavior.get("threshold"))
+
+    count_keys = [
+        "syn_no_ack_packets",
+        "unique_syn_ports",
+        "max_syn_no_ack_per_window",
+        "max_unique_syn_dst_ports_per_window",
+        "icmp_echo_packets",
+        "http_login_attempts",
+        "ssh_attempts",
+        "count",
+    ]
+    count_text = None
+    for key in count_keys:
+        value = first_present(signature.get(key), behavior.get(key))
+        if value is not None:
+            count_text = f"{format_key(key)}: {value}"
             break
-        statuses[stage] = "Completed"
-    return statuses
+
+    return {
+        "window_seconds": window_seconds,
+        "window_start": window_start,
+        "window_end": window_end,
+        "threshold": threshold,
+        "basis": basis,
+        "count_text": count_text,
+    }
 
 
-def render_pipeline_summary(result):
-    statuses = stage_statuses(result)
-    stage_html = "".join(
-        f"<span class='stage'>{safe_text(stage)} <small style='color:{status_color(status)}'>{safe_text(status)}</small></span>"
-        for stage, status in statuses.items()
-    )
+def render_time_window_block(alert):
+    info = time_window_info(alert)
+    window_seconds = info["window_seconds"]
+    window_start = info["window_start"]
+    window_end = info["window_end"]
+    threshold = info["threshold"]
+    basis = info["basis"]
+    count_text = info["count_text"] or "Windowed evidence extracted from alert fields"
+
+    body = f"""
+    <div class="evidence-box">
+        <div class="tiny-label">Time Window Evidence</div>
+        <div class="metric-value" style="margin-top:6px;">{safe_text(count_text)}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+            {badge(f"Window: {format_time(window_start)} -> {format_time(window_end)}", "#c084fc")}
+            {badge(f"Duration: {window_seconds or '-'} sec", "#06b6d4")}
+            {badge(f"Threshold: {threshold if threshold is not None else '-'}", "#f59e0b")}
+            {badge(f"Basis: {basis}", "#a855f7")}
+        </div>
+    </div>
+    """
+    st.markdown(body, unsafe_allow_html=True)
+
+
+def evidence_rows(evidence):
+    rows = []
+    for key, value in (evidence or {}).items():
+        if isinstance(value, (dict, list, tuple, set)):
+            display = json.dumps(value, ensure_ascii=False)
+        else:
+            display = value
+        rows.append({"Field": format_key(key), "Value": str(display)})
+    return rows
+
+
+def render_evidence_table(title, evidence):
+    st.markdown(f"**{title}**")
+    rows = evidence_rows(evidence)
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.caption("No structured evidence supplied for this section.")
+
+
+def render_mitre_card(alert):
+    attack_type = alert.get("attack_type")
+    mapping = MITRE_MAPPING.get(attack_type)
+    if not mapping:
+        mapping = {
+            "tactic": "Unknown",
+            "technique": "Unmapped",
+            "sub_technique": "N/A",
+            "url": "",
+            "description": "No MITRE mapping is configured for this alert type.",
+        }
+    url = mapping.get("url") or "#"
     st.markdown(
         f"""
-        <div class="panel">
-            <p class="panel-title">Pipeline Execution Summary</p>
-            <p class="panel-copy">Upload -> Parse -> Extract Events -> Signature Detection -> Behavior Detection -> Hybrid Correlation -> Enrichment -> Results</p>
-            <div class="stage-wrap" style="margin-top:10px;">{stage_html}</div>
+        <div class="mitre-card">
+            <div class="tiny-label">MITRE ATT&CK Mapping</div>
+            <div class="mitre-technique-id">{safe_text(mapping.get("technique"))}</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+                {badge(mapping.get("tactic"), "#c084fc")}
+                {badge(mapping.get("sub_technique"), "#06b6d4")}
+            </div>
+            <p>{safe_text(mapping.get("description"))}</p>
+            <a href="{safe_text(url)}" target="_blank">Open MITRE reference</a>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_errors(result):
-    if not result or not result.get("errors"):
+def render_actions(alert):
+    attack_type = alert.get("attack_type")
+    actions = RECOMMENDED_ACTIONS.get(attack_type, [])
+    recommendation = alert.get("recommendation")
+    items = []
+    if recommendation:
+        items.append(f"<div class='action-item'><span class='check-box'></span><span>{safe_text(recommendation)}</span></div>")
+    for action in actions:
+        items.append(f"<div class='action-item'><span class='check-box'></span><span>{safe_text(action)}</span></div>")
+    st.markdown(
+        f"""
+        <div class="glass-card">
+            <div class="section-title">Recommended Actions</div>
+            {''.join(items) if items else '<p>No recommendations supplied.</p>'}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_limitations(alert):
+    limitation = alert.get("limitations") or alert.get("limitation") or "No limitation notes supplied for this detector."
+    st.markdown(
+        f"""
+        <div class="warning-card">
+            <div class="tiny-label">Limitations</div>
+            <div style="margin-top:8px;">{safe_text(limitation)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_virustotal(alert):
+    vt = alert.get("virustotal")
+    if not vt:
         return
-    st.warning("Analysis completed with warnings or failures.")
-    for error in result.get("errors", []):
-        with st.expander(f"{error.get('stage', 'unknown').title()} issue"):
-            st.write(error)
+    st.markdown("**VirusTotal / Enrichment**")
+    if isinstance(vt, dict):
+        rows = [{"Field": format_key(k), "Value": str(v)} for k, v in vt.items()]
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.write(vt)
 
 
-def counts_by(alerts, field):
-    return dict(Counter(str(alert.get(field) or "UNKNOWN") for alert in alerts))
+def expander_label(index, alert):
+    severity = str(alert.get("severity") or "UNKNOWN").upper()
+    method = str(alert.get("detection_method") or "unknown").upper()
+    src = alert.get("src_ip") or "unknown source"
+    dst = alert.get("dst_ip") or alert.get("target_ip") or "multiple/unknown targets"
+    return f"[{severity}] [{method}] Alert #{index}: {normalize_attack_name(alert)} | {src} -> {dst}"
 
 
-def count_rows(counts, label):
-    return [
-        {label: key, "Count": value}
-        for key, value in sorted(counts.items(), key=lambda item: item[1], reverse=True)
-    ]
+def render_alert_card(index, alert):
+    severity = str(alert.get("severity") or "UNKNOWN").upper()
+    method = str(alert.get("detection_method") or "unknown").lower()
+    confidence = str(alert.get("confidence") or "UNKNOWN").upper()
+    behavior_score = alert.get("behavior_score", "-")
+    signature, behavior = evidence_dict(alert)
+
+    with st.expander(expander_label(index, alert), expanded=index == 1):
+        st.markdown(
+            f"""
+            <div class="evidence-box">
+                <div class="tiny-label">Evidence</div>
+                <div style="font-size:16px;color:#f1f0ff;margin-top:8px;">{safe_text(alert.get("evidence") or "No evidence summary supplied.")}</div>
+            </div>
+            <div class="mini-grid">
+                <div class="mini-cell"><div class="tiny-label">Detection Method</div><div class="metric-value" style="color:{method_color(method)};">{safe_text(method.upper())}</div></div>
+                <div class="mini-cell"><div class="tiny-label">Severity</div><div class="metric-value" style="color:{severity_color(severity)};">{safe_text(severity)}</div></div>
+                <div class="mini-cell"><div class="tiny-label">Confidence</div><div class="metric-value">{safe_text(confidence)}</div></div>
+                <div class="mini-cell"><div class="tiny-label">Behavior Score</div><div class="metric-value">{safe_text(behavior_score)}</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        render_time_window_block(alert)
+
+        ev_col1, ev_col2 = st.columns(2)
+        with ev_col1:
+            render_evidence_table("Signature Evidence", signature)
+        with ev_col2:
+            render_evidence_table("Behavior Evidence", behavior)
+
+        render_mitre_card(alert)
+        render_actions(alert)
+        render_limitations(alert)
+        render_virustotal(alert)
 
 
-def counter_rows(items, label):
-    return [
-        {label: item[0], "Packets": item[1]}
-        for item in items
-        if isinstance(item, (tuple, list)) and len(item) == 2
-    ]
+# ---------------------------------------------------------------------------
+# Tab 1: Alerts and detections
+# ---------------------------------------------------------------------------
+
+def init_filter_state():
+    for key, default in {
+        "severity_filter": "ALL",
+        "method_filter": "ALL",
+        "attack_filter": "ALL",
+        "ip_filter": "",
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
 
 
-def suspicious_hosts(alerts):
-    hosts = Counter(alert.get("src_ip") for alert in alerts if alert.get("src_ip"))
-    return [{"Source IP": ip, "Alert Count": count} for ip, count in hosts.most_common(10)]
+def reset_filter_state():
+    st.session_state.severity_filter = "ALL"
+    st.session_state.method_filter = "ALL"
+    st.session_state.attack_filter = "ALL"
+    st.session_state.ip_filter = ""
 
 
-def compact_host_rows(host_profiles):
+def render_filter_controls(alerts):
+    init_filter_state()
+    attack_options = ["ALL"] + sorted({str(alert.get("attack_type") or "unknown") for alert in alerts})
+
+    cols = st.columns([1, 1, 1.2, 1.5, 0.8])
+    with cols[0]:
+        st.selectbox("Severity", ["ALL", "HIGH", "MEDIUM", "LOW"], key="severity_filter")
+    with cols[1]:
+        st.selectbox("Detection Method", ["ALL", "hybrid", "signature", "behavior"], key="method_filter")
+    with cols[2]:
+        st.selectbox("Attack Type", attack_options, key="attack_filter")
+    with cols[3]:
+        st.text_input("Search Source/Destination IP", key="ip_filter", placeholder="192.168.1.10")
+    with cols[4]:
+        st.write("")
+        st.write("")
+        st.button("Reset Filters", on_click=reset_filter_state, width="stretch")
+
+    return filter_alerts(
+        alerts,
+        st.session_state.severity_filter,
+        st.session_state.method_filter,
+        st.session_state.attack_filter,
+        st.session_state.ip_filter,
+    )
+
+
+def render_alerts_tab(result):
+    alerts = result.get("alerts") or []
+
+    chart_cols = st.columns([1, 1, 1])
+    with chart_cols[0]:
+        attack_counts = Counter(normalize_attack_name(alert) for alert in alerts)
+        fig = donut_chart(list(attack_counts.keys()), list(attack_counts.values()), "Attack Type Distribution")
+        render_plotly_or_empty(fig, "No alert distribution yet.")
+    with chart_cols[1]:
+        source_counts = suspicious_hosts(alerts).most_common(10)
+        fig = horizontal_bar_chart(source_counts, "Top Suspicious Source IPs", color="#a855f7", x_title="Alerts")
+        render_plotly_or_empty(fig, "No suspicious source IPs found.")
+    with chart_cols[2]:
+        render_severity_breakdown(alerts)
+
+    st.markdown(section_card("Alert Filters", "<p>Filter detections by severity, method, attack type, or IP address.</p>"), unsafe_allow_html=True)
+    filtered = render_filter_controls(alerts)
+
+    st.markdown(
+        f"""
+        <div class="glass-card">
+            <div class="section-title">Detected Alerts</div>
+            <p>Showing <b>{len(filtered)}</b> of <b>{len(alerts)}</b> alerts from this PCAP analysis run.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if filtered:
+        triage_rows = []
+        for idx, alert in enumerate(filtered, start=1):
+            window = time_window_info(alert)
+            window_text = f"{format_time(window['window_start'])} -> {format_time(window['window_end'])}"
+            triage_rows.append(
+                {
+                    "#": idx,
+                    "Attack Type": normalize_attack_name(alert),
+                    "Severity": alert.get("severity", "-"),
+                    "Confidence": alert.get("confidence", "-"),
+                    "Detection Method": alert.get("detection_method", "-"),
+                    "Source IP": alert.get("src_ip", "-"),
+                    "Destination IP": alert.get("dst_ip", "-"),
+                    "Time Window": window_text,
+                    "Evidence Summary": alert.get("evidence", "-"),
+                }
+            )
+        st.dataframe(triage_rows, width="stretch", hide_index=True)
+    else:
+        st.info("No alerts match the current filters.")
+
+    for idx, alert in enumerate(filtered, start=1):
+        render_alert_card(idx, alert)
+
+    st.markdown("### Export Filtered Alerts")
+    export_cols = st.columns(2)
+    with export_cols[0]:
+        st.download_button(
+            "Export Alerts JSON",
+            data=json.dumps(filtered, indent=2, ensure_ascii=False),
+            file_name="autonetir_filtered_alerts.json",
+            mime="application/json",
+            width="stretch",
+        )
+    with export_cols[1]:
+        st.download_button(
+            "Export Alerts CSV",
+            data=alerts_to_csv(filtered, run_id=result.get("run_id") or "unknown"),
+            file_name="autonetir_filtered_alerts.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tab 2: PCAP intelligence
+# ---------------------------------------------------------------------------
+
+def top_rows(items, limit=15):
+    rows = []
+    for item in (items or [])[:limit]:
+        if isinstance(item, dict):
+            label = item.get("ip") or item.get("src_ip") or item.get("dst_ip") or item.get("key") or "unknown"
+            value = item.get("count") or item.get("packet_count") or item.get("value") or 0
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            label, value = item[0], item[1]
+        else:
+            continue
+        rows.append((label, value))
+    return rows
+
+
+def render_protocol_distribution(stats):
+    protocol_counts = stats.get("protocol_counts") or {}
+    labels = list(protocol_counts.keys())
+    values = list(protocol_counts.values())
+    colors = [PROTOCOL_COLORS.get(str(label).upper(), "#6b5fa0") for label in labels]
+    fig = donut_chart(labels, values, "Protocol Distribution", colors=colors)
+    render_plotly_or_empty(fig, "No protocol statistics were produced.")
+
+
+def render_host_intelligence(summary):
+    host_profiles = summary.get("host_profiles") or []
     columns = [
         "src_ip",
         "packet_count",
@@ -691,10 +1725,26 @@ def compact_host_rows(host_profiles):
         "max_http_login_attempts_per_window",
         "icmp_echo",
     ]
-    return [{format_key(column): row.get(column, 0) for column in columns if column in row} for row in host_profiles[:25]]
+    rename = {
+        "src_ip": "Source IP",
+        "packet_count": "Packets",
+        "unique_destinations": "Unique Destinations",
+        "unique_dst_ports": "Unique Destination Ports",
+        "max_unique_syn_dst_ports_per_window": "Max Scan Ports / Window",
+        "max_ssh_attempts_per_window": "Max SSH Attempts / Window",
+        "max_http_login_attempts_per_window": "Max HTTP Login / Window",
+        "icmp_echo": "ICMP Echo",
+    }
+    rows = normalize_table_rows(host_profiles, columns, rename)
+    st.markdown("### Host Intelligence")
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.info("No host behavior profiles were generated.")
 
 
-def compact_pair_rows(pair_profiles):
+def render_flow_intelligence(summary):
+    pair_profiles = summary.get("pair_profiles") or []
     columns = [
         "src_ip",
         "dst_ip",
@@ -705,446 +1755,177 @@ def compact_pair_rows(pair_profiles):
         "http_requests",
         "syn_ratio",
     ]
-    return [{format_key(column): row.get(column, 0) for column in columns if column in row} for row in pair_profiles[:25]]
-
-
-def attack_distribution(alerts):
-    counts = Counter(alert.get("attack_type", "UNKNOWN") for alert in alerts)
-    ordered_types = [
-        "port_scan",
-        "dos_attack",
-        "arp_poisoning",
-        "ssh_bruteforce",
-        "http_login_bruteforce",
-    ]
-    rows = []
-    for attack_type in ordered_types:
-        rows.append({"Attack Type": attack_label(attack_type), "Alerts": counts.get(attack_type, 0)})
-    for attack_type, count in counts.items():
-        if attack_type not in ordered_types:
-            rows.append({"Attack Type": attack_label(attack_type), "Alerts": count})
-    return rows
-
-
-def render_visualizations(result):
-    if not result:
-        return
-    alerts = result.get("alerts", [])
-    stats = result.get("stats", {})
-
-    st.markdown("### PCAP Analysis Visualizations")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Protocol Distribution**")
-        st.dataframe(count_rows(stats.get("protocol_counts", {}), "Protocol"), use_container_width=True, hide_index=True)
-        st.markdown("**Alerts by Severity**")
-        st.dataframe(count_rows(counts_by(alerts, "severity"), "Severity"), use_container_width=True, hide_index=True)
-        st.markdown("**Top Source IPs**")
-        st.dataframe(counter_rows(stats.get("top_sources", []), "Source IP"), use_container_width=True, hide_index=True)
-    with col2:
-        st.markdown("**Attack Type Distribution**")
-        st.dataframe(attack_distribution(alerts), use_container_width=True, hide_index=True)
-        st.markdown("**Detection Method Breakdown**")
-        st.dataframe(count_rows(counts_by(alerts, "detection_method"), "Method"), use_container_width=True, hide_index=True)
-        st.markdown("**Top Destination IPs**")
-        st.dataframe(counter_rows(stats.get("top_destinations", []), "Destination IP"), use_container_width=True, hide_index=True)
-
-    st.markdown("**Suspicious Hosts**")
-    st.dataframe(suspicious_hosts(alerts), use_container_width=True, hide_index=True)
-
-
-def summary_cards(result):
-    alerts = result.get("alerts", []) if result else []
-    metadata = st.session_state.get("capture_metadata", {})
-    high_alerts = sum(1 for alert in alerts if alert.get("severity") == "HIGH")
-    hybrid_alerts = sum(1 for alert in alerts if alert.get("detection_method") == "hybrid")
-    signature_alerts = sum(1 for alert in alerts if alert.get("detection_method") == "signature")
-    behavior_alerts = sum(1 for alert in alerts if alert.get("detection_method") == "behavior")
-    suspicious_count = len({alert.get("src_ip") for alert in alerts if alert.get("src_ip")})
-
-    cols = st.columns(4)
-    with cols[0]:
-        kpi_card("Total Packets", format_number(result.get("packet_count", 0)), "Events extracted", "#7dd3fc")
-    with cols[1]:
-        kpi_card("Total Alerts", format_number(len(alerts)), "Detected alerts", "#f8fbff")
-    with cols[2]:
-        kpi_card("High Severity", format_number(high_alerts), "Review first", severity_color("HIGH"))
-    with cols[3]:
-        kpi_card("Capture Duration", format_duration(metadata.get("capture_duration")), "Inside uploaded PCAP", "#22c55e")
-
-    cols = st.columns(4)
-    with cols[0]:
-        kpi_card("Hybrid Alerts", format_number(hybrid_alerts), "Signature + behavior", method_color("hybrid"))
-    with cols[1]:
-        kpi_card("Signature-only Alerts", format_number(signature_alerts), "Known rule matched", method_color("signature"))
-    with cols[2]:
-        kpi_card("Behavior-only Alerts", format_number(behavior_alerts), "Peer-baseline anomaly", method_color("behavior"))
-    with cols[3]:
-        kpi_card("Suspicious Hosts", format_number(suspicious_count), "Unique alert sources", "#f59e0b")
-
-
-def render_overview(result):
-    if not result:
-        render_waiting_panel()
-        return
-    summary_cards(result)
-    render_pipeline_summary(result)
-    render_visualizations(result)
-
-
-def alert_window_parts(alert):
-    signature = alert.get("signature_evidence", {})
-    behavior = alert.get("behavior_evidence", {})
-    evidence = signature or behavior
-    seconds = signature.get("window_seconds") or behavior.get("window_seconds")
-    start = signature.get("window_start")
-    if start is None:
-        start = behavior.get("window_start")
-    end = signature.get("window_end")
-    if end is None:
-        end = behavior.get("window_end")
-    return evidence, seconds, start, end
-
-
-def alert_window_text(alert):
-    _, seconds, start, end = alert_window_parts(alert)
-    if not seconds:
-        return "N/A"
-    return f"{format_time(start)} -> {format_time(end)} ({seconds}s)"
-
-
-def time_window_statement(alert):
-    evidence, seconds, start, end = alert_window_parts(alert)
-    if not seconds:
-        return "No explicit time-window evidence was included for this alert."
-
-    count_fields = [
-        ("syn_no_ack_packets", "SYN packets"),
-        ("unique_syn_ports", "unique ports scanned"),
-        ("ssh_syn_attempts", "SSH SYN attempts"),
-        ("login_post_attempts", "HTTP login POST attempts"),
-        ("icmp_echo_packets", "ICMP echo packets"),
-    ]
-    count_text = None
-    for key, label in count_fields:
-        if key in evidence:
-            count_text = f"{evidence[key]} {label} in {seconds} seconds"
-            break
-    if count_text is None:
-        count_text = f"Activity exceeded the detector threshold in {seconds} seconds"
-
-    threshold = evidence.get("threshold")
-    basis = "time_window_signature" if alert.get("signature_evidence") else "time_window_behavior"
-    pieces = [
-        count_text,
-        f"Threshold: {threshold}/window" if threshold is not None else "Threshold: behavior baseline",
-        f"Window: {format_time(start)} -> {format_time(end)}",
-        f"Detection Basis: {basis}",
-    ]
-    return "\n".join(pieces)
-
-
-def normalize_alert_rows(alerts):
-    rows = []
-    for index, alert in enumerate(alerts, start=1):
-        rows.append({
-            "#": index,
-            "Attack Type": alert.get("alert_type", "Unknown Attack"),
-            "Severity": alert.get("severity", "UNKNOWN"),
-            "Confidence": alert.get("confidence", "UNKNOWN"),
-            "Detection Method": str(alert.get("detection_method", "unknown")).upper(),
-            "Source IP": alert.get("src_ip") or "N/A",
-            "Destination IP": alert.get("dst_ip") or "N/A",
-            "Time Window / Timestamp": alert_window_text(alert),
-            "Evidence Summary": alert.get("evidence", "No evidence available"),
-        })
-    return rows
-
-
-def alerts_to_csv(alerts):
-    if not alerts:
-        return ""
-    fieldnames = sorted({key for alert in alerts for key in alert.keys()})
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
-    writer.writeheader()
-    for alert in alerts:
-        row = {}
-        for key in fieldnames:
-            value = alert.get(key, "")
-            row[key] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
-        writer.writerow(row)
-    return buffer.getvalue()
-
-
-def filter_alerts(alerts, severity, method, attack_type, ip_search):
-    filtered = list(alerts)
-    if severity != "ALL":
-        filtered = [alert for alert in filtered if alert.get("severity") == severity]
-    if method != "ALL":
-        filtered = [alert for alert in filtered if alert.get("detection_method") == method]
-    if attack_type != "ALL":
-        filtered = [alert for alert in filtered if alert.get("attack_type") == attack_type]
-    if ip_search:
-        query = ip_search.strip().lower()
-        filtered = [
-            alert for alert in filtered
-            if query in str(alert.get("src_ip") or "").lower()
-            or query in str(alert.get("dst_ip") or "").lower()
-        ]
-    return filtered
-
-
-def render_alert_card(alert, index):
-    severity = alert.get("severity", "UNKNOWN")
-    method = alert.get("detection_method", "unknown")
-    st.markdown(
-        f"""
-        <div class="alert-card" style="border-left: 6px solid {severity_color(severity)};">
-            <div class="alert-head">
-                <div>
-                    <h3 class="alert-title">{safe_text(index)}. {safe_text(alert.get("alert_type", "Unknown Attack"))}</h3>
-                    <div class="flow">{safe_text(alert.get("src_ip") or "N/A")} -> {safe_text(alert.get("dst_ip") or "N/A")}</div>
-                </div>
-                <div>
-                    {badge(str(method).upper(), method_color(method))}
-                    {badge(str(severity).upper(), severity_color(severity))}
-                    {badge(str(alert.get("confidence", "UNKNOWN")).upper(), "#2563eb")}
-                </div>
-            </div>
-            <p class="evidence">{safe_text(alert.get("evidence", "No evidence available"))}</p>
-            <div class="mini-grid">
-                <div class="mini"><div class="mini-label">Window</div><div class="mini-value">{safe_text(alert_window_text(alert))}</div></div>
-                <div class="mini"><div class="mini-label">Attack</div><div class="mini-value">{safe_text(alert.get("attack_type", "unknown"))}</div></div>
-                <div class="mini"><div class="mini-label">Score</div><div class="mini-value">{safe_text(alert.get("behavior_score", 0))}</div></div>
-                <div class="mini"><div class="mini-label">Method</div><div class="mini-value">{safe_text(str(method).upper())}</div></div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_field_table(value):
-    if not value:
-        st.caption("No data")
-        return
-    rows = []
-    for key, item in value.items():
-        rendered = json.dumps(item, ensure_ascii=False) if isinstance(item, (dict, list)) else item
-        rows.append({"Field": format_key(key), "Value": rendered})
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-
-def render_alert_drawer(alert):
-    if not alert:
-        st.markdown(
-            """
-            <div class="drawer">
-                <div class="drawer-title">Alert Details</div>
-                <p class="drawer-copy">Select an alert to inspect its forensic evidence.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    st.markdown('<div class="drawer">', unsafe_allow_html=True)
-    st.markdown("### Alert Details")
-    drawer_block("Alert Summary", alert.get("evidence", "No evidence available"))
-    drawer_block("Source and Destination", f"{alert.get('src_ip') or 'N/A'} -> {alert.get('dst_ip') or 'N/A'}")
-    drawer_block("Detection Method", str(alert.get("detection_method", "unknown")).upper())
-    drawer_block("Severity and Confidence", f"{alert.get('severity', 'UNKNOWN')} / {alert.get('confidence', 'UNKNOWN')}")
-    drawer_block("Time Window Evidence", time_window_statement(alert).replace("\n", "<br>"), allow_html=True)
-
-    st.markdown("**Signature Evidence**")
-    render_field_table(alert.get("signature_evidence", {}))
-    st.markdown("**Behavior Evidence**")
-    render_field_table(alert.get("behavior_evidence", {}))
-    drawer_block("Recommendation", alert.get("recommendation", "No recommendation available"))
-    drawer_block("Limitations", alert.get("limitations") or "No specific limitation.")
-    if alert.get("virustotal"):
-        st.markdown("**VirusTotal**")
-        render_field_table(alert.get("virustotal", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def drawer_block(title, copy, allow_html=False):
-    content = copy if allow_html else safe_text(copy)
-    st.markdown(
-        f"""
-        <div class="drawer-block">
-            <div class="drawer-title">{safe_text(title)}</div>
-            <p class="drawer-copy">{content}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_alerts(result):
-    if not result:
-        render_waiting_panel()
-        return
-    all_alerts = result.get("alerts", [])
-    if not all_alerts:
-        st.info("No detected alerts in this PCAP analysis.")
-        return
-
-    st.markdown("### Detected Alerts")
-    attack_types = sorted({alert.get("attack_type") for alert in all_alerts if alert.get("attack_type")})
-    methods = sorted({alert.get("detection_method") for alert in all_alerts if alert.get("detection_method")})
-    col1, col2, col3, col4 = st.columns(4)
-    severity = col1.selectbox("Severity", ["ALL", "HIGH", "MEDIUM", "LOW"])
-    method = col2.selectbox("Detection Method", ["ALL"] + methods)
-    attack_type = col3.selectbox("Attack Type", ["ALL"] + attack_types)
-    ip_search = col4.text_input("Source/Destination IP")
-
-    filtered = filter_alerts(all_alerts, severity, method, attack_type, ip_search)
-
-    exp1, exp2, exp3 = st.columns([1, 1, 3])
-    exp1.download_button(
-        "Export JSON",
-        data=json.dumps(filtered, indent=2, ensure_ascii=False),
-        file_name=f"{result.get('run_id', 'autonetir')}_alerts.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    exp2.download_button(
-        "Export CSV",
-        data=alerts_to_csv(filtered),
-        file_name=f"{result.get('run_id', 'autonetir')}_alerts.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    exp3.caption(f"Showing {len(filtered)} of {len(all_alerts)} detected alerts")
-
-    if not filtered:
-        st.info("No alerts match the selected filters.")
-        return
-
-    st.dataframe(normalize_alert_rows(filtered), use_container_width=True, hide_index=True)
-
-    labels = [
-        f"{i + 1}. {alert.get('alert_type', 'Unknown')} | {alert.get('src_ip') or 'N/A'} -> {alert.get('dst_ip') or 'N/A'}"
-        for i, alert in enumerate(filtered)
-    ]
-    selected_label = st.selectbox("Open Alert Details", labels)
-    selected_index = labels.index(selected_label)
-
-    left, right = st.columns([1.45, 1])
-    with left:
-        for index, alert in enumerate(filtered, start=1):
-            render_alert_card(alert, index)
-    with right:
-        render_alert_drawer(filtered[selected_index])
-
-
-def render_evidence(result):
-    if not result:
-        render_waiting_panel()
-        return
-    stats = result.get("stats", {})
-    summary = result.get("detection_summary", {})
-    host_profiles = summary.get("host_profiles", [])
-    pair_profiles = summary.get("pair_profiles", [])
-
-    st.markdown("### PCAP Evidence Summary")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Protocol Distribution**")
-        st.dataframe(count_rows(stats.get("protocol_counts", {}), "Protocol"), use_container_width=True, hide_index=True)
-        st.markdown("**Top Source IPs**")
-        st.dataframe(counter_rows(stats.get("top_sources", []), "Source IP"), use_container_width=True, hide_index=True)
-    with right:
-        st.markdown("**Top Destination IPs**")
-        st.dataframe(counter_rows(stats.get("top_destinations", []), "Destination IP"), use_container_width=True, hide_index=True)
-        st.markdown("**Suspicious Hosts**")
-        st.dataframe(suspicious_hosts(result.get("alerts", [])), use_container_width=True, hide_index=True)
-
-    st.markdown("**Host Profiles**")
-    if host_profiles:
-        st.dataframe(compact_host_rows(host_profiles), use_container_width=True, hide_index=True)
-        with st.expander("Raw host behavior profiles"):
-            st.dataframe(host_profiles, use_container_width=True)
+    rename = {
+        "src_ip": "Source IP",
+        "dst_ip": "Destination IP",
+        "packet_count": "Packets",
+        "max_syn_no_ack_per_window": "Max SYN-No-ACK / Window",
+        "max_icmp_echo_per_window": "Max ICMP Echo / Window",
+        "unique_syn_dst_ports": "Unique SYN Destination Ports",
+        "http_requests": "HTTP Requests",
+        "syn_ratio": "SYN Ratio",
+    }
+    rows = normalize_table_rows(pair_profiles, columns, rename)
+    st.markdown("### Flow Intelligence")
+    if rows:
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
-        st.info("No host behavior profiles available.")
-
-    st.markdown("**Flow Profiles**")
-    if pair_profiles:
-        st.dataframe(compact_pair_rows(pair_profiles), use_container_width=True, hide_index=True)
-        with st.expander("Raw source-to-target profiles"):
-            st.dataframe(pair_profiles[:100], use_container_width=True)
-    else:
-        st.info("No flow behavior profiles available.")
+        st.info("No flow behavior profiles were generated.")
 
 
-def render_engine_explanation():
-    st.markdown("### Hybrid Detection Engine")
+def render_arp_identity_map(summary):
+    rows = arp_identity_rows(summary)
+    st.markdown("### ARP Identity Map")
+
+    if not rows:
+        st.info("No ARP identity data found in this capture.")
+        return
+
+    conflicts = [row for row in rows if row["MAC Count"] > 1]
+    if conflicts:
+        conflict_ips = ", ".join(row["IP Address"] for row in conflicts)
+        st.warning(f"Possible ARP identity conflicts found for: {conflict_ips}")
+
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def render_capture_timeline():
+    metadata = st.session_state.capture_metadata or {}
     cols = st.columns(3)
     with cols[0]:
-        info_panel("Signature", "Matched a known attack rule such as SYN flood, port scan, or ARP identity conflict.")
+        render_kpi("First Packet Time", format_time(metadata.get("first_packet_time")), "Capture start")
     with cols[1]:
-        info_panel("Behavior", "Abnormal compared to peer hosts or flows inside the same uploaded PCAP.")
+        render_kpi("Last Packet Time", format_time(metadata.get("last_packet_time")), "Capture end")
     with cols[2]:
-        info_panel("Hybrid", "Signature and behavior agree, so the alert confidence is higher.")
+        render_kpi("Capture Duration", format_duration(metadata.get("capture_duration")), "Forensic time span")
 
 
-def render_project():
-    render_engine_explanation()
-    st.markdown("### Methodology")
-    st.code(
-        "Upload PCAP -> Parse -> Extract Events -> Signature Detection -> Behavior Detection -> Hybrid Correlation -> Enrichment -> Results",
-        language="text",
+def render_hybrid_engine_explanation():
+    st.markdown(
+        """
+        <div class="glass-card">
+            <div class="section-title">Hybrid Detection Engine</div>
+            <div class="mini-grid">
+                <div class="mini-cell"><div class="tiny-label">Signature</div><div class="metric-value" style="color:#06b6d4;">Known Rule</div><p>Matched a defined attack rule or threshold.</p></div>
+                <div class="mini-cell"><div class="tiny-label">Behavior</div><div class="metric-value" style="color:#f97316;">Peer Baseline</div><p>Abnormal compared to hosts in the same PCAP.</p></div>
+                <div class="mini-cell"><div class="tiny-label">Hybrid</div><div class="metric-value" style="color:#c084fc;">Correlated</div><p>Both evidence types agreed, raising confidence.</p></div>
+                <div class="mini-cell"><div class="tiny-label">Scope</div><div class="metric-value">PCAP Only</div><p>This dashboard analyzes uploaded captures, not live traffic.</p></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    st.markdown("### Attack Coverage")
-    for attack in ATTACK_REGISTRY:
-        limitation = attack["limitations"]
-        if attack["id"] == "dos_attack":
-            limitation = (
-                "DoS detection is time-window based for SYN and ICMP floods. "
-                "HTTP flood is disabled to reduce false positives from web responses."
-            )
+
+
+def render_pcap_intelligence_tab(result):
+    stats = result.get("stats") or {}
+    summary = result.get("detection_summary") or {}
+
+    top_cols = st.columns([1, 1])
+    with top_cols[0]:
+        render_protocol_distribution(stats)
+    with top_cols[1]:
+        render_hybrid_engine_explanation()
+
+    traffic_cols = st.columns(2)
+    with traffic_cols[0]:
+        fig = horizontal_bar_chart(top_rows(stats.get("top_sources"), limit=15), "Top Source IPs", color="#06b6d4", x_title="Packets")
+        render_plotly_or_empty(fig, "No source IP statistics were produced.")
+    with traffic_cols[1]:
+        fig = horizontal_bar_chart(top_rows(stats.get("top_destinations"), limit=15), "Top Destination IPs", color="#7c3aed", x_title="Packets")
+        render_plotly_or_empty(fig, "No destination IP statistics were produced.")
+
+    render_host_intelligence(summary)
+    render_flow_intelligence(summary)
+    render_arp_identity_map(summary)
+
+    st.markdown("### Capture Timeline")
+    render_capture_timeline()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def render_sidebar():
+    tshark_status, vt_status = environment_status()
+    with st.sidebar:
         st.markdown(
-            f"""
-            <div class="coverage-card">
-                <div class="coverage-title">{safe_text(attack['name'])}</div>
-                <p class="coverage-copy"><strong>Recommendation:</strong> {safe_text(attack['recommendation'])}</p>
-                <p class="coverage-copy"><strong>Limitation:</strong> {safe_text(limitation)}</p>
+            """
+            <div style="padding:8px 0 18px 0;">
+                <div style="font-size:28px;font-weight:900;color:#f1f0ff;text-shadow:0 0 20px rgba(192,132,252,0.7);">AutoNetIR</div>
+                <div style="color:#a89cc8;font-size:13px;font-weight:700;">Purple DFIR PCAP Analysis</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        st.markdown("**Detection Mode**")
+        st.markdown("- Hybrid IDS")
+        st.markdown("- Signature detection")
+        st.markdown("- Behavior baseline")
+        st.markdown("- Hybrid correlation")
 
+        st.markdown("**Supported Attacks**")
+        for attack in ATTACK_REGISTRY:
+            st.markdown(f"- {attack.get('name', attack.get('id'))}")
+
+        st.markdown("**Environment**")
+        st.caption(f"TShark: {tshark_status}")
+        st.caption(f"VirusTotal: {vt_status}")
+
+        result = st.session_state.get("analysis_result")
+        if result:
+            st.markdown("**Current Run**")
+            st.caption(f"Run ID: {result.get('run_id') or '-'}")
+            st.caption(f"File: {st.session_state.get('pcap_file_name') or '-'}")
+            st.caption(f"Timestamp: {st.session_state.get('analysis_timestamp') or '-'}")
+
+
+# ---------------------------------------------------------------------------
+# Error state
+# ---------------------------------------------------------------------------
+
+def render_error_state(result):
+    render_run_overview(result)
+    render_pipeline_summary(failed=True)
+    errors = result.get("errors") or []
+    st.error("The analysis pipeline failed. Review the details below.")
+    if errors:
+        for idx, error in enumerate(errors, start=1):
+            with st.expander(f"Error #{idx}: {error.get('stage', 'unknown')}"):
+                st.json(error)
+    render_upload_card(after_analysis=True)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     inject_css()
+    init_session_state()
     render_sidebar()
 
     result = st.session_state.get("analysis_result")
-    render_header(result)
-    render_errors(result)
 
-    if result and result.get("success") is False:
-        st.error("Analysis failed. Check pipeline errors and parser details.")
+    if not result:
+        render_landing_header()
+        render_upload_card(after_analysis=False)
+        return
 
-    render_upload_card(after_analysis=bool(result))
+    if not result.get("success"):
+        render_error_state(result)
+        return
 
-    overview_tab, alerts_tab, evidence_tab, project_tab = st.tabs([
-        "Analysis Overview",
-        "Detected Alerts",
-        "PCAP Evidence",
-        "Hybrid IDS",
-    ])
+    render_run_overview(result)
+    render_pipeline_summary()
+    render_upload_card(after_analysis=True)
 
-    with overview_tab:
-        render_overview(result)
-    with alerts_tab:
-        render_alerts(result)
-    with evidence_tab:
-        render_evidence(result)
-    with project_tab:
-        render_project()
+    tab_alerts, tab_pcap = st.tabs(["Alerts & Detections", "PCAP Intelligence"])
+    with tab_alerts:
+        render_alerts_tab(result)
+    with tab_pcap:
+        render_pcap_intelligence_tab(result)
 
 
 if __name__ == "__main__":

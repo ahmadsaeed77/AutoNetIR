@@ -1,4 +1,6 @@
-streamlit
-pyshark
-requests
-pytest
+streamlit>=1.33.0
+pyshark>=0.6
+requests>=2.31.0
+plotly>=5.18.0
+pytest>=7.4.0
+python-dotenv>=1.0.0
